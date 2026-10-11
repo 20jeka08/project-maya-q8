@@ -748,12 +748,17 @@ def check_pc(a) -> dict:
 def choose_context(a, prev_ctx) -> int:
     if a.context:
         return a.context
-    default = prev_ctx if prev_ctx in CONTEXTS else DEFAULT_CONTEXT
+    # the dashboard saves any context the engine accepted (393216, 90112, ...), not only CONTEXTS:
+    # offer it first so a --setup --rebuild keeps it instead of silently resetting to the default
+    opts = ([prev_ctx] if prev_ctx and prev_ctx not in CONTEXTS else []) + CONTEXTS
+    labels = [(f"{c // 1024}K tokens",
+               ("as now" if c == prev_ctx and c not in CONTEXTS
+                else "recommended" if c == DEFAULT_CONTEXT else None), None) for c in opts]
+    default = opts.index(prev_ctx) if prev_ctx in opts else opts.index(DEFAULT_CONTEXT)
     pick = choose("Context?", ["Context length = how much text the model sees at once (the chat, files, tool output). "
                                "A longer one takes", "VRAM from the expert cache, so answers get a little slower:"],
-                  [(f"{c // 1024}K tokens", "recommended" if c == DEFAULT_CONTEXT else None, None) for c in CONTEXTS],
-                  CONTEXTS.index(default), a.yes)
-    return CONTEXTS[pick]
+                  labels, default, a.yes)
+    return opts[pick]
 
 
 def shard_names(m: dict, pattern: str | None = None) -> list:
