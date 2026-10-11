@@ -4,58 +4,6 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
-## v1.0.34 - 2026-10-11
-
-Fixes from your reports: a two-GPU Windows PC whose RAM tier came out smaller in v1.0.33, and builds on CUDA 12.0-12.2.
-Also two new opt-in settings for machines that read experts from the SSD.
-
-- **A split's RAM tiers near Windows' pinning cap** (#110, from #105). A two-GPU Windows PC pinned 35.6 GB of its
-  44 GB RAM budget on v1.0.33 against 42.6 on v1.0.32, so more experts came from the SSD. The fix:
-  - the GPUs pin their tiers one after another, so only the one that reaches the cap gives way;
-  - a tier leaves 512 MB of room under the cap;
-  - the expert tables upload through the engine's own pinned buffer, so reaching the cap no longer stops the start with
-    `the warmed expert tables did not upload`.
-- **Windows with two NUMA nodes or more** (#110, from #56): the engine log says which processor group and node the
-  engine runs in, and where the RAM tier's pages are, to find why some starts decode slower than others.
-- **Builds on CUDA 12.0-12.2** (#107 by @Ajay9o9), the version Ubuntu's `nvidia-cuda-toolkit` installs.
-- **New, opt-in: `STRATA_GLM_DISK_READERS=<n>`** (#108 by @Ajay9o9). Prompts read the experts that come from the SSD
-  with n threads, each expert whole, handed on as soon as it lands. On a DRAM-less NVMe, prompts read 25-50% faster; an
-  NVMe with its own DRAM can lose instead, so measure yours. The answers stay the same.
-- **New, opt-in, it changes the answers: `STRATA_GLM_TRUNK_KEEP` / `_MAP`** (#103 by @sociolog), for a RAM-bound split
-  that would rather be faster. The model's own layers leave out their lowest-ranked experts that aren't in VRAM, as the
-  MTP draft does, layer by layer with the map. On an RTX 3090 + 3060, Maya-M decoded 23% faster with the map in the
-  README's row, KL 0.018 from the full model.
-
-## v1.0.33 - 2026-10-11
-
-Several conversations at once on a layer split, a short request no longer waits for a long answer, `--calibrate` also
-tunes the disk reads, and fixes from your reports: a start that failed on Windows, a speed that changed between
-restarts, and ZFS.
-
-- **Several conversations at once on a layer split** (#94 by @0xPreDa): with `STRATA_GLM_SEQS=<n>` on two GPUs or more,
-  n conversations decode together, each card of the split working on a different one instead of waiting for the
-  others. On 4x RTX 4090, four conversations at once give 225 tok/s in total. It's off by default; one GPU gains
-  nothing from it. With it on, every conversation writes the same tokens as it would alone.
-- **A short request no longer waits for a whole long answer** (#93 by @0xPreDa):
-  - requests are served in arrival order;
-  - with `STRATA_FAIR_SLICE_S=<s>`, a long answer that has been decoding for s seconds while another request waits
-    lets it in, then continues from where it was.
-
-  On 2x V100, a short question asked during a 700-token answer got its first word after 10 s instead of 60.
-- **`--calibrate` tunes the disk reads too** (#99, from #67): when part of the model is read from the SSD while it
-  answers, the tuning also tries reading each expert in fewer, larger pieces (`STRATA_GLM_READ_CHUNKS`), and keeps a
-  size only when it is more than 3% faster. A Windows laptop on an Intel RST RAID decoded 15% faster with 4 pieces than
-  with the default 8; a Linux NVMe stays fastest at 8.
-- **Fixes from your reports** (#99):
-  - **A start that failed right after the RAM tier** on Windows (`pinned disk staging did not allocate`, #67): the
-    small pinned buffers are now set up before the tier, so a cap on pinned memory makes the tier slightly smaller
-    instead of stopping the start.
-  - **A speed that changed between restarts** (#56): the CPU lane's timing at start is now taken over half a second,
-    and keeps the fastest round, so a burst of other work at that moment no longer slows the whole session.
-  - **ZFS:** the memory ZFS's cache can give back now counts as free RAM when the RAM tier is sized (#89).
-  - **The prefetch** says its settings in the engine log when it is on (#6).
-- The README has rows for the new settings.
-
 ## v1.0.32 - 2026-10-11
 
 A new model to download, Maya-M-Derisked. A split's GPUs now load at once, a split of three or more GPUs no longer
