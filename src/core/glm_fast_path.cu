@@ -1320,7 +1320,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             // raced for the room under it - a 2x RTX 3080 box's first part shrank to 13.1 of its planned 21.5 GB while
             // the second pinned all of its 22.5 (#105).  In turn, only the part that reaches the cap gives way
             // BISECT A: sequential pinning off - parts pin in parallel like v1.0.32
-            split_load_->wait_pin(part_);   // BISECT B: gate back on
+            // split_load_->wait_pin(part_);
         }
         // the small pinned buffers first - the table updates and the disk reads' staging (an expert a routed entry):
         // where the driver caps what can be pinned (Windows: an RTX 5090 Laptop with 64 GB, the cap reached at a 45.3
@@ -1360,7 +1360,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                     // with two tiers pinned right up to it the warmed tables' upload failed (#105).  512 MB more that
                     // will not pin: a step less
                     void* room = nullptr;
-                    if (cudaHostAlloc(&room, (size_t) 0, cudaHostAllocDefault) == cudaSuccess)   // BISECT B: probe neutered (was 512 MB) {
+                    if (cudaHostAlloc(&room, (size_t) 512 << 20, cudaHostAllocDefault) == cudaSuccess) {
                         cudaFreeHost(room);
                         break;
                     }
@@ -1399,7 +1399,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             F->ram_bytes += (size_t) n * R.stride;
         }
         // BISECT A: pass_pin off with it
-        if (split_load_ != nullptr) split_load_->pass_pin(part_);   // BISECT B
+        // if (split_load_ != nullptr) split_load_->pass_pin(part_);
         if (split_load_ == nullptr && !staging_only && ram_budget_ < 0 && remaining >= 0) {
             remaining = std::max<int64_t>(0, remaining - (int64_t) F->ram_bytes);
             remaining_layers -= n_moe;
