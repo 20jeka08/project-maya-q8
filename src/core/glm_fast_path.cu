@@ -1230,7 +1230,14 @@ bool Glm5Model::fast_setup(std::string& err) {
                     R.registered = true;
                     break;
                 }
-                if (cudaHostAlloc(&p, (size_t) n * R.stride, cudaHostAllocPortable) == cudaSuccess) break;
+                const cudaError_t ce = cudaHostAlloc(&p, (size_t) n * R.stride, cudaHostAllocPortable);
+                if (ce == cudaSuccess) break;
+                // say why, at the size that failed: 'out of memory' here is the machine's page-locked
+                // ceiling, not a config mistake, and the 7/8 shrink below used to hide it entirely
+                // (a 2-GPU split failed at 140 GiB a part with 470 GB of RAM and 640 GB of commit
+                // free, and nothing in the log said so - issue: the SSD-resident experts question)
+                std::fprintf(stderr, "glm fast: CUDA%d pinned tier: %.1f GiB refused: %s\n", dev_,
+                             (double) ((size_t) n * R.stride) / 1073741824.0, cudaGetErrorString(ce));
                 cudaGetLastError();
                 p = nullptr;
                 n = (n > least && n * 7 / 8 < least) ? least : n * 7 / 8;
