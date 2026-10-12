@@ -224,6 +224,28 @@ __global__ void scale_kernel(float* __restrict__ y, float s, int n) {
     if (i < n) y[i] *= s;
 }
 
+/// rope_norm_kernel with the position read from the device (a captured graph serves every token).
+__global__ void rope_dev_kernel(float* __restrict__ x, int n_vec, int stride, int off, int n_rot,
+                                const int* __restrict__ pos, float theta_scale) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int half = n_rot / 2;
+    if (idx >= n_vec * half) return;
+    const int v = idx / half, i = idx % half;
+    const float theta = (float) (*pos) * powf(theta_scale, (float) i);
+    const float c = cosf(theta), s = sinf(theta);
+    float* p = x + (size_t) v * stride + off + 2 * i;
+    const float x0 = p[0], x1 = p[1];
+    p[0] = x0 * c - x1 * s;
+    p[1] = x0 * s + x1 * c;
+}
+
+/// base[pos * row + i] = src[i], the position from the device.
+__global__ void store_row_kernel(float* __restrict__ base, int row, const float* __restrict__ src,
+                                 const int* __restrict__ pos) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < row) base[(size_t) (*pos) * row + i] = src[i];
+}
+
 const strata::kernels::cpu::NativeFmt& fmt_of(void* p) { return *(const strata::kernels::cpu::NativeFmt*) p; }
 
 }  // namespace
@@ -382,6 +404,11 @@ void GlmCpuPool::run(int n, const std::function<void(int)>& fn) {
 
 GlmDsaModel::~GlmDsaModel() {
     if (!allocs_.empty() || cache_) cudaSetDevice(dev_);
+    for (auto* v : {&gA_, &gB_, &gS_, &gC_})
+        for (void* e : *v)
+            if (e) cudaGraphExecDestroy((cudaGraphExec_t) e);
+    if (gstream_) cudaStreamDestroy((cudaStream_t) gstream_);
+    if (pin_) cudaFreeHost(pin_);
     if (cublas_) cublasDestroy((cublasHandle_t) cublas_);
     for (void* p : allocs_) cudaFree(p);
     for (auto& e : experts_) delete (strata::kernels::cpu::NativeFmt*) e.fmt;
@@ -662,7 +689,7 @@ bool GlmDsaModel::moe_cpu(int il, const std::vector<int>& ids, const std::vector
     const ExpertLayer& L = experts_[(size_t) il];
     const kc::NativeFmt& f = fmt_of(L.fmt);
     const int k = (int) ids.size();
-    kc::native_quant_act(f, h_x_.data(), h_act_.data());
+    kc::native_quant_act(f, moe_x_ ? moe_x_ : h_x_.data(), h_act_.data());
     const void* act[1] = {h_act_.data()};
 
     // gate/up: k experts x (n_ff / RG) row chunks
@@ -691,7 +718,7 @@ bool GlmDsaModel::moe_cpu(int il, const std::vector<int>& ids, const std::vector
     for (int j = 0; j < g.n_embd; ++j) {
         float acc = 0.0f;
         for (int i = 0; i < k; ++i) acc += rw[(size_t) i] * h_dn_[(size_t) i * g.n_embd + j];
-        h_moe_[(size_t) j] = acc;
+        (moe_y_ ? moe_y_ : h_moe_.data())[(size_t) j] = acc;
     }
     (void) err;
     return true;
@@ -707,6 +734,12 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
         err = "glm-dsa: token id " + std::to_string(token) + " out of range";
         return false;
     }
+    // the graph decode unless STRATA_GLM_GRAPHS=0 (and not under the checks that read every op: the profiler,
+    // the seam capture)
+    static const bool graphs = !(std::getenv("STRATA_GLM_GRAPHS") && std::atoi(std::getenv("STRATA_GLM_GRAPHS")) == 0) &&
+                               !(std::getenv("STRATA_GLM_PROFILE") && std::atoi(std::getenv("STRATA_GLM_PROFILE"))) &&
+                               !(std::getenv("STRATA_GLM_F32_GEMV") && std::atoi(std::getenv("STRATA_GLM_F32_GEMV")));
+    if (graphs && !capture_) return step_graph(token, logits, err, head);
     GD_CHECK(cudaSetDevice(dev_));
     const auto t0 = std::chrono::steady_clock::now();
     double cpu_ms = 0;
@@ -945,6 +978,308 @@ void GlmDsaModel::take_timing(double& dev_ms, double& cpu_ms, double& total_ms) 
     cpu_ms = t_cpu_;
     total_ms = t_total_;
     t_dev_ = t_cpu_ = t_total_ = 0;
+}
+
+// ================================ the graph decode ================================
+//
+// step() issues ~25 launches and 4 synchronous copies a layer; on this Windows box (WDDM) every one of them costs
+// host latency the GPU waits through, ~75 ms a token for ~14 ms of weight reads.  step_graph() runs the same
+// kernels in the same order, recorded once per layer into CUDA graphs on a stream of its own:
+//   A  attention inputs: norms, q_a / kv_a, the cache row, the indexer key (full layers) and its query/weights, q, qabs
+//   -  [outside: the indexer selection past top_k cells, then the attention - their sizes change every token]
+//   B  out-proj + residual, ffn_norm, then the dense FFN + residual, or the router with its ids/weights and the
+//      normed activation copied to pinned host memory
+//   S  the shared expert (runs while the CPU does the routed ones)
+//   C  the routed result back from pinned memory, + shared, + residual
+// The position the kernels need is read from the device (d_pos_), so one recording serves every token.
+
+bool GlmDsaModel::gemv_s(const DevW& w, const float* x, float* y, void* stream, std::string& err) {
+    cudaStream_t s = (cudaStream_t) stream;
+    if (w.type == 0) {
+        gemv_f32_kernel<<<nblk(w.n_out * 32), T_, 0, s>>>((const float*) w.d, x, y, (int) w.n_out, (int) w.n_in);
+    } else {
+        strata::kernels::quantize_q8_1_rows(x, 1, w.n_in, q8_, s);
+        strata::kernels::native_mmvq(w.type, w.d, q8_, y, (int) w.n_in, (int) w.n_out, 1, s);
+    }
+    GD_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool GlmDsaModel::build_graphs(std::string& err) {
+    const GlmDsaGeometry& g = g_;
+    cudaStream_t s = nullptr;
+    GD_CHECK(cudaStreamCreate(&s));
+    gstream_ = s;
+    GD_CHECK(cudaHostAlloc((void**) &pin_, (size_t) (128 + 3 * g.n_embd + 64) * sizeof(float), cudaHostAllocDefault));
+    GD_CHECK(cudaMalloc(&d_pos_, sizeof(int)));
+    allocs_.push_back(d_pos_);
+    GD_CHECK(cudaMalloc(&ikv_, (size_t) g.idx_key * sizeof(float)));
+    allocs_.push_back(ikv_);
+
+    // the step path's scratch carve-up (the same buffers, so the two paths are interchangeable mid-sequence)
+    float* x = sc_;
+    float* xn = x + g.n_embd;
+    float* tmp = xn + g.n_embd;
+    float* moe = tmp + g.n_embd;
+    float* sh = moe + g.n_embd;
+    float* router = sh + g.n_embd;
+    float* rw = router + 4 * g.n_embd;
+    int* ids = (int*) (rw + 64);
+    float* qr = (float*) (ids + 64);
+    float* kvpe = qr + g.q_lora;
+    float* q = kvpe + g.cache_row();
+    float* qabs = q + (size_t) g.n_head * g.qk_head();
+    float* o = qabs + (size_t) g.n_head * g.kv_lora;
+    float* gate = o + (size_t) g.n_head * g.v_head;
+    float* up = gate + g.n_ff_dense;
+    float* hh = up + g.n_ff_dense;
+    float* iq = hh + g.n_ff_dense;
+    float* iw = iq + (size_t) g.idx_heads * g.idx_key;
+    float* h_rwids = pin_;               // rw (64) then ids (64): rw and ids sit back to back on the device too
+    float* h_x = pin_ + 128;
+    float* h_moe = h_x + g.n_embd;
+
+    const float theta_scale = std::pow(g.rope_base, -2.0f / (float) g.qk_rope);
+    const auto record = [&](void*& out, const std::function<bool()>& body) -> bool {
+        GD_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+        const bool ok = body();
+        cudaGraph_t graph = nullptr;
+        const cudaError_t e = cudaStreamEndCapture(s, &graph);
+        if (!ok) return false;
+        if (e != cudaSuccess) {
+            err = std::string("glm-dsa graphs: capture failed: ") + cudaGetErrorString(e);
+            return false;
+        }
+        cudaGraphExec_t ex = nullptr;
+        GD_CHECK(cudaGraphInstantiate(&ex, graph, 0));
+        cudaGraphDestroy(graph);
+        out = ex;
+        return true;
+    };
+
+    gA_.assign((size_t) g.n_layers, nullptr);
+    gB_.assign((size_t) g.n_layers, nullptr);
+    gS_.assign((size_t) g.n_layers, nullptr);
+    gC_.assign((size_t) g.n_layers, nullptr);
+    for (int il = 0; il < g.n_layers; ++il) {
+        float* cache = cache_ + (size_t) il * (size_t) max_ctx_ * g.cache_row();
+        const bool full = g.indexer_full[(size_t) il];
+        if (!record(gA_[(size_t) il], [&]() -> bool {
+                rms_norm_kernel<<<1, T_, 0, s>>>(x, (const float*) W(il, "attn_norm.weight").d, xn, g.n_embd,
+                                                 g.norm_eps);
+                if (!gemv_s(W(il, "attn_q_a.weight"), xn, qr, s, err)) return false;
+                rms_norm_kernel<<<1, T_, 0, s>>>(qr, (const float*) W(il, "attn_q_a_norm.weight").d, qr, g.q_lora,
+                                                 g.norm_eps);
+                if (!gemv_s(W(il, "attn_kv_a_mqa.weight"), xn, kvpe, s, err)) return false;
+                rms_norm_kernel<<<1, T_, 0, s>>>(kvpe, (const float*) W(il, "attn_kv_a_norm.weight").d, kvpe,
+                                                 g.kv_lora, g.norm_eps);
+                rope_dev_kernel<<<nblk(g.qk_rope / 2), T_, 0, s>>>(kvpe, 1, g.cache_row(), g.kv_lora, g.qk_rope,
+                                                                   d_pos_, theta_scale);
+                store_row_kernel<<<nblk(g.cache_row()), T_, 0, s>>>(cache, g.cache_row(), kvpe, d_pos_);
+                if (full) {
+                    float* ik = ikeys_ + (size_t) ik_slot_[(size_t) il] * (size_t) max_ctx_ * g.idx_key;
+                    if (!gemv_s(W(il, "indexer.attn_k.weight"), xn, ikv_, s, err)) return false;
+                    layer_norm_kernel<<<1, 128, 0, s>>>(ikv_, (const float*) W(il, "indexer.k_norm.weight").d,
+                                                        (const float*) W(il, "indexer.k_norm.bias").d, ikv_, g.idx_key,
+                                                        g.idx_norm_eps);
+                    rope_dev_kernel<<<nblk(g.qk_rope / 2), T_, 0, s>>>(ikv_, 1, g.idx_key, 0, g.qk_rope, d_pos_,
+                                                                       theta_scale);
+                    store_row_kernel<<<nblk(g.idx_key), T_, 0, s>>>(ik, g.idx_key, ikv_, d_pos_);
+                    // the query side of the selection: cheap (2 small GEMVs), so always computed and the graph
+                    // stays one shape; it is read only past top_k cells
+                    if (!gemv_s(W(il, "indexer.attn_q_b.weight"), qr, iq, s, err)) return false;
+                    rope_dev_kernel<<<nblk(g.idx_heads * g.qk_rope / 2), T_, 0, s>>>(iq, g.idx_heads, g.idx_key, 0,
+                                                                                     g.qk_rope, d_pos_, theta_scale);
+                    if (!gemv_s(W(il, "indexer.proj.weight"), xn, iw, s, err)) return false;
+                    scale_kernel<<<1, T_, 0, s>>>(iw, 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads)),
+                                                  g.idx_heads);
+                }
+                if (!gemv_s(W(il, "attn_q_b.weight"), qr, q, s, err)) return false;
+                rope_dev_kernel<<<nblk(g.n_head * g.qk_rope / 2), T_, 0, s>>>(q, g.n_head, g.qk_head(), g.qk_nope,
+                                                                              g.qk_rope, d_pos_, theta_scale);
+                q_absorb_kernel<<<nblk((int64_t) g.n_head * g.kv_lora * 32), T_, 0, s>>>(
+                    (const float*) W(il, "attn_k_b.weight").d, q, qabs, g.qk_nope, g.qk_head(), g.kv_lora, g.n_head);
+                return true;
+            }))
+            return false;
+        if (!record(gB_[(size_t) il], [&]() -> bool {
+                if (!gemv_s(W(il, "attn_output.weight"), o, tmp, s, err)) return false;
+                add_kernel<<<nblk(g.n_embd), T_, 0, s>>>(x, tmp, g.n_embd);
+                rms_norm_kernel<<<1, T_, 0, s>>>(x, (const float*) W(il, "ffn_norm.weight").d, xn, g.n_embd,
+                                                 g.norm_eps);
+                if (il < g.dense_lead) {
+                    if (!gemv_s(W(il, "ffn_gate.weight"), xn, gate, s, err) ||
+                        !gemv_s(W(il, "ffn_up.weight"), xn, up, s, err))
+                        return false;
+                    strata::kernels::glm_swiglu_clamp(gate, up, INFINITY, g.n_ff_dense, hh, s);
+                    if (!gemv_s(W(il, "ffn_down.weight"), hh, tmp, s, err)) return false;
+                    add_kernel<<<nblk(g.n_embd), T_, 0, s>>>(x, tmp, g.n_embd);
+                } else {
+                    if (!gemv_s(W(il, "ffn_gate_inp.weight"), xn, router, s, err)) return false;
+                    strata::kernels::router_sigmoid(router, (const float*) W(il, "exp_probs_b.bias").d, 1,
+                                                    g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, ids, rw, s);
+                    GD_CHECK(cudaMemcpyAsync(h_rwids, rw, 128 * sizeof(float), cudaMemcpyDeviceToHost, s));
+                    GD_CHECK(cudaMemcpyAsync(h_x, xn, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToHost, s));
+                }
+                return true;
+            }))
+            return false;
+        if (il < g.dense_lead) continue;
+        if (!record(gS_[(size_t) il], [&]() -> bool {
+                if (!gemv_s(W(il, "ffn_gate_shexp.weight"), xn, gate, s, err) ||
+                    !gemv_s(W(il, "ffn_up_shexp.weight"), xn, up, s, err))
+                    return false;
+                strata::kernels::glm_swiglu_clamp(gate, up, INFINITY, (int64_t) g.n_ff_exp * g.n_shared, hh, s);
+                return gemv_s(W(il, "ffn_down_shexp.weight"), hh, sh, s, err);
+            }))
+            return false;
+        if (!record(gC_[(size_t) il], [&]() -> bool {
+                GD_CHECK(cudaMemcpyAsync(moe, h_moe, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, s));
+                add_kernel<<<nblk(g.n_embd), T_, 0, s>>>(moe, sh, g.n_embd);
+                add_kernel<<<nblk(g.n_embd), T_, 0, s>>>(x, moe, g.n_embd);
+                return true;
+            }))
+            return false;
+    }
+    return true;
+}
+
+bool GlmDsaModel::step_graph(int32_t token, float* logits, std::string& err, bool head) {
+    const GlmDsaGeometry& g = g_;
+    GD_CHECK(cudaSetDevice(dev_));
+    if (!gstream_) {
+        const auto b0 = std::chrono::steady_clock::now();
+        if (!build_graphs(err)) return false;
+        std::fprintf(stderr, "glm-dsa: decode graphs recorded (%d layers) in %.0f ms\n", g.n_layers,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0).count());
+    }
+    cudaStream_t s = (cudaStream_t) gstream_;
+    const auto t0 = std::chrono::steady_clock::now();
+    double cpu_ms = 0;
+    const int p = (int) pos_;
+    static const bool blas_on = !(std::getenv("STRATA_GLM_DECODE_BLAS") && std::atoi(std::getenv("STRATA_GLM_DECODE_BLAS")) == 0);
+    static const int blas_min = std::getenv("STRATA_GLM_BLAS_MIN") ? std::atoi(std::getenv("STRATA_GLM_BLAS_MIN")) : 1024;
+    const bool dec_blas = blas_on && p + 1 > blas_min;
+
+    float* x = sc_;
+    float* xn = x + g.n_embd;
+    float* router = xn + 4 * g.n_embd;   // (tmp, moe, sh, router) - only `score` below is used here
+    float* rw = router + 4 * g.n_embd;
+    int* ids = (int*) (rw + 64);
+    float* qr = (float*) (ids + 64);
+    float* kvpe = qr + g.q_lora;
+    float* q = kvpe + g.cache_row();
+    float* qabs = q + (size_t) g.n_head * g.qk_head();
+    float* o = qabs + (size_t) g.n_head * g.kv_lora;
+    float* gate = o + (size_t) g.n_head * g.v_head;
+    float* iq = gate + 3 * (size_t) g.n_ff_dense;
+    float* iw = iq + (size_t) g.idx_heads * g.idx_key;
+    float* score = iw + 64;
+    const float* h_rw = pin_;
+    const int* h_ids = (const int*) (pin_ + 64);
+    float* h_x = pin_ + 128;
+    float* h_moe = h_x + g.n_embd;
+    float* h_emb = h_moe + g.n_embd;
+    int* h_pos = (int*) (h_emb + g.n_embd);
+
+    // the embedding row and the position
+    {
+        const size_t row = ggml_row_size((ggml_type) tok_embd_->type, g.n_embd);
+        ggml_get_type_traits((ggml_type) tok_embd_->type)
+            ->to_float(tok_embd_file_->tensor_data(*tok_embd_) + row * (size_t) token, h_emb, g.n_embd);
+        *h_pos = p;
+        GD_CHECK(cudaMemcpyAsync(x, h_emb, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, s));
+        GD_CHECK(cudaMemcpyAsync(d_pos_, h_pos, sizeof(int), cudaMemcpyHostToDevice, s));
+    }
+    const float kq_scale = 1.0f / std::sqrt((float) g.qk_head());
+    const int n_vis = p + 1;
+    int n_sel = n_vis;
+    bool sparse = false;
+    std::vector<int> v_ids((size_t) g.n_exp_used);
+    std::vector<float> v_rw((size_t) g.n_exp_used);
+
+    for (int il = 0; il < g.n_layers; ++il) {
+        const float* cache = cache_ + (size_t) il * (size_t) max_ctx_ * g.cache_row();
+        GD_CHECK(cudaGraphLaunch((cudaGraphExec_t) gA_[(size_t) il], s));
+        if (g.indexer_full[(size_t) il]) {
+            if (n_vis > g.idx_top_k) {
+                // the selection: the scores on the device, the top_k on the host (as step does)
+                const float* ik = ikeys_ + (size_t) ik_slot_[(size_t) il] * (size_t) max_ctx_ * g.idx_key;
+                GD_CHECK(cudaStreamSynchronize(s));
+                if (dec_blas) {
+                    if (!decode_index_scores(ik, iq, iw, score, n_vis, err)) return false;
+                } else {
+                    const size_t smem = (size_t) (g.idx_heads * g.idx_key + g.idx_heads) * sizeof(float);
+                    indexer_score_kernel<<<nblk(n_vis), T_, smem>>>(iq, ik, iw, score, n_vis, g.idx_heads, g.idx_key);
+                }
+                h_score_.resize((size_t) n_vis);
+                GD_CHECK(cudaMemcpy(h_score_.data(), score, (size_t) n_vis * sizeof(float), cudaMemcpyDeviceToHost));
+                cells_.resize((size_t) n_vis);
+                std::iota(cells_.begin(), cells_.end(), 0);
+                std::nth_element(cells_.begin(), cells_.begin() + g.idx_top_k, cells_.end(), [&](int a, int b) {
+                    return h_score_[(size_t) a] > h_score_[(size_t) b] ||
+                           (h_score_[(size_t) a] == h_score_[(size_t) b] && a < b);
+                });
+                cells_.resize((size_t) g.idx_top_k);
+                std::sort(cells_.begin(), cells_.end());
+                if (dec_blas) {
+                    if (!decode_mask(cells_, n_vis, err)) return false;
+                } else {
+                    GD_CHECK(cudaMemcpy(d_cells_, cells_.data(), cells_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                }
+                n_sel = g.idx_top_k;
+                sparse = true;
+            } else {
+                n_sel = n_vis;
+                sparse = false;
+            }
+        }
+        // the attention (its size changes every token): on the legacy stream, which orders against `s`
+        if (dec_blas) {
+            if (!decode_attend(cache, p, q, qabs, o, (const float*) W(il, "attn_v_b.weight").d, sparse, err))
+                return false;
+        } else {
+            const size_t smem = (size_t) (g.cache_row() + g.kv_lora + 32 + n_sel) * sizeof(float);
+            mla_attn_kernel<<<g.n_head, T_, smem, s>>>(qabs, q, cache, sparse ? d_cells_ : nullptr, n_sel,
+                                                      (const float*) W(il, "attn_v_b.weight").d, o, g.kv_lora,
+                                                      g.qk_nope, g.qk_rope, g.v_head, kq_scale);
+        }
+        GD_CHECK(cudaGetLastError());
+        GD_CHECK(cudaGraphLaunch((cudaGraphExec_t) gB_[(size_t) il], s));
+        if (il < g.dense_lead) continue;
+        GD_CHECK(cudaStreamSynchronize(s));   // the route and the activation are in pinned memory now
+        for (int i = 0; i < g.n_exp_used; ++i) {
+            v_ids[(size_t) i] = h_ids[i];
+            v_rw[(size_t) i] = h_rw[i];
+        }
+        capture_ids(il, v_ids.data(), v_rw.data());
+        GD_CHECK(cudaGraphLaunch((cudaGraphExec_t) gS_[(size_t) il], s));   // the shared expert, meanwhile
+        const auto c0 = std::chrono::steady_clock::now();
+        moe_x_ = h_x;
+        moe_y_ = h_moe;
+        const bool ok = moe_cpu(il, v_ids, v_rw, err);
+        moe_x_ = nullptr;
+        moe_y_ = nullptr;
+        if (!ok) return false;
+        cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+        GD_CHECK(cudaGraphLaunch((cudaGraphExec_t) gC_[(size_t) il], s));
+    }
+
+    if (logits || head) {
+        rms_norm_kernel<<<1, T_, 0, s>>>(x, (const float*) w_.at("output_norm.weight").d, xn, g.n_embd, g.norm_eps);
+        if (!gemv_s(w_.at("output.weight"), xn, d_logits_buf_, s, err)) return false;
+        d_logits_ = d_logits_buf_;
+        if (logits)
+            GD_CHECK(cudaMemcpyAsync(logits, d_logits_buf_, (size_t) g.n_vocab * sizeof(float), cudaMemcpyDeviceToHost,
+                                     s));
+    }
+    GD_CHECK(cudaStreamSynchronize(s));
+    ++pos_;
+    const double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    t_total_ += total;
+    t_cpu_ += cpu_ms;
+    t_dev_ += total - cpu_ms;
+    return true;
 }
 
 }  // namespace strata::core

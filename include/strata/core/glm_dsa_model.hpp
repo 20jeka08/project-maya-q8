@@ -146,6 +146,11 @@ private:
     bool upload(const std::string& name, bool keep_quant, std::string& err);
     const strata::TensorInfo* find(const std::string& name, const strata::GgufFile** file = nullptr) const;
     bool gemv(const DevW& w, const float* x, float* y, std::string& err);
+    /// gemv on an explicit stream (graph capture)
+    bool gemv_s(const DevW& w, const float* x, float* y, void* stream, std::string& err);
+    /// The decode step as per-layer CUDA graphs on a stream of its own (STRATA_GLM_GRAPHS=0: step's per-op path).
+    bool step_graph(int32_t token, float* logits, std::string& err, bool head);
+    bool build_graphs(std::string& err);
     const DevW& W(int il, const char* suffix) const;
     bool moe_cpu(int il, const std::vector<int>& ids, const std::vector<float>& rw, std::string& err);
     // the batched path (src/core/glm_dsa_prefill.cu)
@@ -221,6 +226,15 @@ private:
 
     double t_dev_ = 0, t_cpu_ = 0, t_total_ = 0;
     double prof_acc_[12] = {};
+    // the graph decode: a stream, per layer A (attention inputs), B (out-proj .. router), S (shared expert),
+    // C (the routed result back + residual); pinned host words; the position on the device
+    void* gstream_ = nullptr;
+    std::vector<void*> gA_, gB_, gS_, gC_;
+    float* pin_ = nullptr;          ///< pinned: [rw 64 | ids 64 | x n_embd | moe n_embd | embd n_embd | pos 64]
+    int* d_pos_ = nullptr;
+    float* ikv_ = nullptr;          ///< the indexer key of the current token before it is stored
+    const float* moe_x_ = nullptr;  ///< moe_cpu's input / output when not h_x_ / h_moe_
+    float* moe_y_ = nullptr;
     int prof_n_ = 0;
 };
 
