@@ -27,6 +27,8 @@
 #include "strata/kernels/sampler.hpp"
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <condition_variable>
 #include <cstdint>
@@ -209,6 +211,16 @@ private:
     std::vector<uint8_t> hb_act_, hb_hq_;
 
     bool capture_ = false;
+    /// STRATA_GLM_ROUTE_LOG=<file>: every routed token's experts appended as text lines 'layer id id ...'
+    void route_log(int il, const int* ids, int n_tok) {
+        static std::FILE* f = std::getenv("STRATA_GLM_ROUTE_LOG") ? std::fopen(std::getenv("STRATA_GLM_ROUTE_LOG"), "a") : nullptr;
+        if (!f) return;
+        for (int t = 0; t < n_tok; ++t) {
+            std::fprintf(f, "%d", il);
+            for (int i = 0; i < g_.n_exp_used; ++i) std::fprintf(f, " %d", ids[t * g_.n_exp_used + i]);
+            std::fputc(10, f);
+        }
+    }
     std::vector<float> cap_;
     std::vector<float> cap_ids_;
     void capture_ids(int il, const int* ids, const float* rw) {

@@ -1253,6 +1253,7 @@ bool GlmDsaModel::step_graph(int32_t token, float* logits, std::string& err, boo
             v_rw[(size_t) i] = h_rw[i];
         }
         capture_ids(il, v_ids.data(), v_rw.data());
+        route_log(il, v_ids.data(), 1);
         GD_CHECK(cudaGraphLaunch((cudaGraphExec_t) gS_[(size_t) il], s));   // the shared expert, meanwhile
         const auto c0 = std::chrono::steady_clock::now();
         moe_x_ = h_x;

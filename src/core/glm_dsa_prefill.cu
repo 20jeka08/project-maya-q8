@@ -533,6 +533,7 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
             const size_t kk = (size_t) T * g.n_exp_used;
             PF_CUDA(cudaMemcpy(hb_ids_.data(), IDS, kk * sizeof(int), cudaMemcpyDeviceToHost));
             PF_CUDA(cudaMemcpy(hb_rw_.data(), RW, kk * sizeof(float), cudaMemcpyDeviceToHost));
+            route_log(il, hb_ids_.data(), T);
             PF_CUDA(cudaMemcpy(hb_x_.data(), XN, (size_t) TE * sizeof(float), cudaMemcpyDeviceToHost));
             capture_ids(il, hb_ids_.data() + (size_t) (T - 1) * g.n_exp_used, hb_rw_.data() + (size_t) (T - 1) * g.n_exp_used);
             // the shared expert on the device while the CPU runs the routed ones
