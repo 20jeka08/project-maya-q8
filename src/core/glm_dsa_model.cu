@@ -711,6 +711,22 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
     const auto t0 = std::chrono::steady_clock::now();
     double cpu_ms = 0;
     const int p = (int) pos_;
+    // decode attention/indexer on cuBLAS once the visible context passes STRATA_GLM_BLAS_MIN cells (1024): measured on
+    // the RTX 5090, 3.3K cells 270 -> 242 ms a token; at ~60 cells the per-head kernels win (222 vs 249 ms).
+    // STRATA_GLM_DECODE_BLAS=0 keeps the per-head kernels everywhere.
+    static const bool blas_on = !(std::getenv("STRATA_GLM_DECODE_BLAS") && std::atoi(std::getenv("STRATA_GLM_DECODE_BLAS")) == 0);
+    static const int blas_min = std::getenv("STRATA_GLM_BLAS_MIN") ? std::atoi(std::getenv("STRATA_GLM_BLAS_MIN")) : 1024;
+    const bool dec_blas = blas_on && p + 1 > blas_min;
+    // STRATA_GLM_PROFILE=1: the device synchronised at each section's end, the time added to its bucket
+    static const bool profile = std::getenv("STRATA_GLM_PROFILE") && std::atoi(std::getenv("STRATA_GLM_PROFILE"));
+    auto mark = std::chrono::steady_clock::now();
+    const auto prof = [&](int s) {
+        if (!profile) return;
+        cudaDeviceSynchronize();
+        const auto n = std::chrono::steady_clock::now();
+        prof_acc_[s] += std::chrono::duration<double, std::milli>(n - mark).count();
+        mark = n;
+    };
 
     // scratch carve-up
     float* x = sc_;
@@ -748,6 +764,7 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
     int n_sel = n_vis;
     bool sparse = false;   // the selection is a subset (d_cells_) rather than every visible cell
 
+    prof(7);
     for (int il = 0; il < g.n_layers; ++il) {
         float* cache = cache_ + (size_t) il * (size_t) max_ctx_ * g.cache_row();
         // ---- attention
@@ -762,6 +779,7 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
                             cudaMemcpyDeviceToDevice));
 
         // the lightning indexer: keys are cached on full layers; the selection matters only past top_k cells
+        prof(0);
         if (g.indexer_full[(size_t) il]) {
             float* ik = ikeys_ + (size_t) ik_slot_[(size_t) il] * (size_t) max_ctx_ * g.idx_key;
             float* ikp = ik + (size_t) p * g.idx_key;
@@ -777,7 +795,11 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
                 if (!gemv(W(il, "indexer.proj.weight"), xn, iw, err)) return false;
                 scale_kernel<<<1, T_>>>(iw, 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads)), g.idx_heads);
                 const size_t smem = (size_t) (g.idx_heads * g.idx_key + g.idx_heads) * sizeof(float);
-                indexer_score_kernel<<<nblk(n_vis), T_, smem>>>(iq, ik, iw, score, n_vis, g.idx_heads, g.idx_key);
+                if (dec_blas) {
+                    if (!decode_index_scores(ik, iq, iw, score, n_vis, err)) return false;
+                } else {
+                    indexer_score_kernel<<<nblk(n_vis), T_, smem>>>(iq, ik, iw, score, n_vis, g.idx_heads, g.idx_key);
+                }
                 h_score_.resize((size_t) n_vis);
                 GD_CHECK(cudaMemcpy(h_score_.data(), score, (size_t) n_vis * sizeof(float), cudaMemcpyDeviceToHost));
                 cells_.resize((size_t) n_vis);
@@ -788,7 +810,11 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
                 });
                 cells_.resize((size_t) g.idx_top_k);
                 std::sort(cells_.begin(), cells_.end());
-                GD_CHECK(cudaMemcpy(d_cells_, cells_.data(), cells_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                if (dec_blas) {
+                    if (!decode_mask(cells_, n_vis, err)) return false;
+                } else {
+                    GD_CHECK(cudaMemcpy(d_cells_, cells_.data(), cells_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                }
                 n_sel = g.idx_top_k;
                 sparse = true;
             } else {
@@ -797,21 +823,30 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
             }
         }
 
+        prof(1);
         if (!gemv(W(il, "attn_q_b.weight"), qr, q, err)) return false;
         rope_norm_kernel<<<nblk(g.n_head * g.qk_rope / 2), T_>>>(q, g.n_head, g.qk_head(), g.qk_nope, g.qk_rope, p,
                                                                  theta_scale);
+        prof(8);
         q_absorb_kernel<<<nblk((int64_t) g.n_head * g.kv_lora * 32), T_>>>(
             (const float*) W(il, "attn_k_b.weight").d, q, qabs, g.qk_nope, g.qk_head(), g.kv_lora, g.n_head);
-        const size_t smem = (size_t) (g.cache_row() + g.kv_lora + 32 + n_sel) * sizeof(float);
-        mla_attn_kernel<<<g.n_head, T_, smem>>>(qabs, q, cache, sparse ? d_cells_ : nullptr, n_sel,
-                                                (const float*) W(il, "attn_v_b.weight").d, o, g.kv_lora, g.qk_nope,
-                                                g.qk_rope, g.v_head, kq_scale);
+        prof(9);
+        if (dec_blas) {
+            if (!decode_attend(cache, p, q, qabs, o, (const float*) W(il, "attn_v_b.weight").d, sparse, err)) return false;
+        } else {
+            const size_t smem = (size_t) (g.cache_row() + g.kv_lora + 32 + n_sel) * sizeof(float);
+            mla_attn_kernel<<<g.n_head, T_, smem>>>(qabs, q, cache, sparse ? d_cells_ : nullptr, n_sel,
+                                                    (const float*) W(il, "attn_v_b.weight").d, o, g.kv_lora, g.qk_nope,
+                                                    g.qk_rope, g.v_head, kq_scale);
+        }
         GD_CHECK(cudaGetLastError());
+        prof(2);
         if (!gemv(W(il, "attn_output.weight"), o, tmp, err)) return false;
         add_kernel<<<nblk(g.n_embd), T_>>>(x, tmp, g.n_embd);
         capture(il, 0, x);
 
         // ---- the FFN
+        prof(3);
         rms_norm_kernel<<<1, T_>>>(x, (const float*) W(il, "ffn_norm.weight").d, xn, g.n_embd, g.norm_eps);
         if (il < g.dense_lead) {
             if (!gemv(W(il, "ffn_gate.weight"), xn, gate, err) || !gemv(W(il, "ffn_up.weight"), xn, up, err))
@@ -825,24 +860,29 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
                                             g.n_exp_used, g.w_scale, g.norm_w != 0, ids, rw, cudaStreamLegacy);
             std::vector<int> h_ids((size_t) g.n_exp_used);
             std::vector<float> h_rw((size_t) g.n_exp_used);
+            prof(10);
             GD_CHECK(cudaMemcpy(h_ids.data(), ids, h_ids.size() * sizeof(int), cudaMemcpyDeviceToHost));
             GD_CHECK(cudaMemcpy(h_rw.data(), rw, h_rw.size() * sizeof(float), cudaMemcpyDeviceToHost));
             GD_CHECK(cudaMemcpy(h_x_.data(), xn, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToHost));
             capture_ids(il, h_ids.data(), h_rw.data());
             // the shared expert runs on the device while the CPU does the routed ones
+            prof(11);
             if (!gemv(W(il, "ffn_gate_shexp.weight"), xn, gate, err) ||
                 !gemv(W(il, "ffn_up_shexp.weight"), xn, up, err))
                 return false;
             strata::kernels::glm_swiglu_clamp(gate, up, INFINITY, (int64_t) g.n_ff_exp * g.n_shared, hh,
                                               cudaStreamLegacy);
             if (!gemv(W(il, "ffn_down_shexp.weight"), hh, sh, err)) return false;
+            prof(4);
             const auto c0 = std::chrono::steady_clock::now();
             if (!moe_cpu(il, h_ids, h_rw, err)) return false;
             cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+            prof(5);
             GD_CHECK(cudaMemcpy(moe, h_moe_.data(), (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice));
             add_kernel<<<nblk(g.n_embd), T_>>>(moe, sh, g.n_embd);   // moe_out + shexp, then the residual
             add_kernel<<<nblk(g.n_embd), T_>>>(x, moe, g.n_embd);
         }
+        prof(6);
         capture(il, 1, x);
     }
 
@@ -853,8 +893,15 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
         if (logits)
             GD_CHECK(cudaMemcpy(logits, d_logits, (size_t) g.n_vocab * sizeof(float), cudaMemcpyDeviceToHost));
     }
+    prof(7);
     GD_CHECK(cudaDeviceSynchronize());
     ++pos_;
+    if (profile && ++prof_n_ % 16 == 0) {
+        static const char* names[12] = {"attn-in", "indexer", "attend", "out-proj", "shexp", "cpu-experts", "moe-tail", "embd+head", "q_b+rope", "absorb", "router", "d2h"};
+        std::fprintf(stderr, "glm-dsa profile (ms/token over %d):", prof_n_);
+        for (int i = 0; i < 12; ++i) std::fprintf(stderr, " %s %.1f", names[i], prof_acc_[i] / prof_n_);
+        std::fprintf(stderr, "\n");
+    }
     const double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     t_total_ += total;
     t_cpu_ += cpu_ms;

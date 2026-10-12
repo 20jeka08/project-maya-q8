@@ -305,6 +305,43 @@ bool GlmDsaModel::moe_cpu_batch(int il, int T, const int* ids, const float* rw, 
     return true;
 }
 
+bool GlmDsaModel::decode_index_scores(const float* ik, const float* iq, const float* iw, float* score, int n_vis,
+                                      std::string& err) {
+    if (!pf_alloc(err)) return false;
+    const float one = 1.0f, zero = 0.0f;
+    const int IH = g_.idx_heads, IK = g_.idx_key;
+    PF_BLAS(cublasSgemm((cublasHandle_t) cublas_, CUBLAS_OP_T, CUBLAS_OP_N, n_vis, IH, IK, &one, ik, IK, iq, IK, &zero,
+                        att_, n_vis));
+    idx_combine_kernel<<<nb(n_vis), TB>>>(att_, iw, score, 1, IH, n_vis, 0, n_vis - 1, n_vis);
+    PF_CUDA(cudaGetLastError());
+    return true;
+}
+
+bool GlmDsaModel::decode_mask(const std::vector<int>& cells, int n_vis, std::string& err) {
+    if (!pf_alloc(err)) return false;
+    h_mask_.assign((size_t) n_vis, 0);
+    for (int c : cells) h_mask_[(size_t) c] = 1;
+    PF_CUDA(cudaMemcpy(d_mask_, h_mask_.data(), (size_t) n_vis, cudaMemcpyHostToDevice));
+    return true;
+}
+
+bool GlmDsaModel::decode_attend(const float* cache, int p, const float* q, float* qabs, float* o, const float* vb,
+                                bool masked, std::string& err) {
+    if (!pf_alloc(err)) return false;
+    const GlmDsaGeometry& g = g_;
+    cublasHandle_t cb = (cublasHandle_t) cublas_;
+    const int H = g.n_head, KL = g.kv_lora, CR = g.cache_row(), QH = g.qk_head(), n = p + 1;
+    const float one = 1.0f, zero = 0.0f, kq = 1.0f / std::sqrt((float) QH);
+    PF_BLAS(cublasSgemm(cb, CUBLAS_OP_T, CUBLAS_OP_N, n, H, KL, &kq, cache, CR, qabs, KL, &zero, att_, n));
+    PF_BLAS(cublasSgemm(cb, CUBLAS_OP_T, CUBLAS_OP_N, n, H, g.qk_rope, &kq, cache + KL, CR, q + g.qk_nope, QH, &one, att_, n));
+    attn_softmax_kernel<<<H, TB>>>(att_, n, 0, p, H, masked ? d_mask_ : nullptr, max_ctx_);
+    PF_BLAS(cublasSgemm(cb, CUBLAS_OP_N, CUBLAS_OP_N, KL, H, n, &one, cache, CR, att_, n, &zero, qabs, KL));
+    PF_BLAS(cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, g.v_head, 1, KL, &one, vb, KL,
+                                      (long long) KL * g.v_head, qabs, H * KL, KL, &zero, o, H * g.v_head, g.v_head, H));
+    PF_CUDA(cudaGetLastError());
+    return true;
+}
+
 bool GlmDsaModel::prefill(const int32_t* toks, int64_t n, std::string& err, bool head,
                           const std::function<void(int64_t, int64_t)>& progress) {
     if (n <= 0) return true;

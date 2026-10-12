@@ -153,6 +153,12 @@ private:
     bool prefill_chunk(const int32_t* toks, int T, bool head, std::string& err);
     bool gemm(const DevW& w, const float* X, float* Y, int T, std::string& err);
     bool moe_cpu_batch(int il, int T, const int* ids, const float* rw, std::string& err);
+    // decode on the batched path's kernels: the indexer's scores and the attention as GEMMs over every visible
+    // cell (all heads at once), the top_k selection as a mask (STRATA_GLM_DECODE_BLAS=0: the per-head kernels)
+    bool decode_index_scores(const float* ik, const float* iq, const float* iw, float* score, int n_vis, std::string& err);
+    bool decode_attend(const float* cache, int p, const float* q, float* qabs, float* o, const float* vb, bool masked,
+                       std::string& err);
+    bool decode_mask(const std::vector<int>& cells, int n_vis, std::string& err);
 
     GlmDsaGeometry g_;
     int dev_ = 0;
@@ -214,6 +220,8 @@ private:
     }
 
     double t_dev_ = 0, t_cpu_ = 0, t_total_ = 0;
+    double prof_acc_[12] = {};
+    int prof_n_ = 0;
 };
 
 }  // namespace strata::core
