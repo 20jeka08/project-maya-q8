@@ -3,6 +3,7 @@
 //
 //   glm_dsa_run --model <any shard>.gguf --tokens 1,2,3 [--tokens-file f] [--ctx 4096] [--dev -1]
 //               [--gen 32] [--top 5] [--eval]
+//   glm_dsa_run --model <any shard>.gguf --tokens-file f --prefill-check [--gen 16]   (batched vs stepwise)
 //   glm_dsa_run --model <any shard>.gguf --serve [--max-context 8192]     (Maya's engine protocol, see serve())
 //
 // --eval prints, for every position, the top-N log-probs and the log-prob of the token that follows (and the
@@ -87,6 +88,8 @@ struct Lines {
 int serve(strata::core::GlmDsaModel& m) {
     const auto& g = m.geometry();
     static const int64_t kEos[] = {154820, 154827, 154829};   // <|endoftext|>, <|user|>, <|observation|>
+    const char* batched_env = std::getenv("STRATA_GLM_BATCHED");   // 0: read prompts token by token
+    const bool batched_off = batched_env && std::atoi(batched_env) == 0;
     Lines in;
     std::thread reader([&] {
         std::string l;
@@ -178,20 +181,30 @@ int serve(strata::core::GlmDsaModel& m) {
         const char* finish = "length";
         const auto t0 = std::chrono::steady_clock::now();
         bool failed = false;
-        for (size_t i = reuse; i < prompt.size(); ++i) {
-            const bool last = i + 1 == prompt.size();
-            if (!m.step(prompt[i], nullptr, err, last)) {
-                failed = true;
-                break;
-            }
-            hist.push_back(prompt[i]);
-            if ((i - reuse) % 8 == 7 || last) {
-                std::printf("PP %zu %zu\n", i + 1 - reuse, prompt.size() - reuse);
+        const size_t n_new = prompt.size() - reuse;
+        if (n_new >= 2 && !batched_off) {
+            // the batched path: chunks of up to STRATA_GLM_CHUNK tokens, a PP line after each
+            failed = !m.prefill(prompt.data() + reuse, (int64_t) n_new, err, true, [&](int64_t done, int64_t n) {
+                std::printf("PP %lld %lld\n", (long long) done, (long long) n);
                 std::fflush(stdout);
-            }
-            if (in.stop) {
-                finish = "cancel";
-                break;
+            });
+            if (!failed) hist.insert(hist.end(), prompt.begin() + (long) reuse, prompt.end());
+        } else {
+            for (size_t i = reuse; i < prompt.size(); ++i) {
+                const bool last = i + 1 == prompt.size();
+                if (!m.step(prompt[i], nullptr, err, last)) {
+                    failed = true;
+                    break;
+                }
+                hist.push_back(prompt[i]);
+                if ((i - reuse) % 8 == 7 || last) {
+                    std::printf("PP %zu %zu\n", i + 1 - reuse, prompt.size() - reuse);
+                    std::fflush(stdout);
+                }
+                if (in.stop) {
+                    finish = "cancel";
+                    break;
+                }
             }
         }
         const auto t1 = std::chrono::steady_clock::now();
@@ -246,13 +259,112 @@ int serve(strata::core::GlmDsaModel& m) {
     return 0;
 }
 
+// the batched prompt against the token-by-token one (which matches llama.cpp): the last prompt position's logits
+// and the greedy continuation that follows each.
+int prefill_check(strata::core::GlmDsaModel& m, const std::vector<int32_t>& toks, int gen, int top_n) {
+    const auto& g = m.geometry();
+    std::string err;
+    std::vector<float> a((size_t) g.n_vocab), b((size_t) g.n_vocab);
+    strata::kernels::SamplerParams sp;
+    sp.greedy = true;
+    const auto continue_greedy = [&](std::vector<int>& out, std::vector<float>& first) -> bool {
+        if (!m.read_logits(first.data(), err)) return false;
+        for (int k = 0; k < gen; ++k) {
+            const int t = m.sample(sp, err);
+            if (t < 0) return false;
+            out.push_back(t);
+            if (!m.step(t, nullptr, err, true)) return false;
+        }
+        return true;
+    };
+    std::vector<int> sa, sb;
+    std::vector<float> cap_a, cap_b;
+    m.reset();
+    m.set_capture(true);
+    auto t0 = std::chrono::steady_clock::now();
+    if (!m.prefill(toks.data(), (int64_t) toks.size(), err, true, [](int64_t d, int64_t n) {
+            std::fprintf(stderr, "prefill %lld/%lld\n", (long long) d, (long long) n);
+        })) {
+        std::fprintf(stderr, "prefill failed: %s\n", err.c_str());
+        return 1;
+    }
+    const double ms_a = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    cap_a = m.captured();
+    const std::vector<float> ids_a = m.captured_ids();
+    m.set_capture(false);
+    if (!continue_greedy(sa, a)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    m.reset();
+    m.set_capture(true);
+    t0 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < toks.size(); ++i)
+        if (!m.step(toks[i], nullptr, err, i + 1 == toks.size())) {
+            std::fprintf(stderr, "step failed: %s\n", err.c_str());
+            return 1;
+        }
+    const double ms_b = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    cap_b = m.captured();
+    const std::vector<float> ids_b = m.captured_ids();
+    for (int il = g.dense_lead; il < g.n_layers; ++il) {
+        const int k = g.n_exp_used;
+        const float* ia = ids_a.data() + (size_t) il * 2 * k;
+        const float* ib = ids_b.data() + (size_t) il * 2 * k;
+        bool same = true;
+        double wd = 0;
+        for (int i = 0; i < k; ++i) same = same && ia[i] == ib[i], wd = std::max(wd, (double) std::fabs(ia[k + i] - ib[k + i]));
+        std::fprintf(stderr, "route L%d: %s  max|dw| %.2e  a=", il, same ? "same" : "DIFF", wd);
+        for (int i = 0; i < k; ++i) std::fprintf(stderr, "%d ", (int) ia[i]);
+        std::fprintf(stderr, " b=");
+        for (int i = 0; i < k; ++i) std::fprintf(stderr, "%d ", (int) ib[i]);
+        std::fprintf(stderr, "\n");
+    }
+    m.set_capture(false);
+    // the seams: relative L2 difference of the last token's residual, after each layer's attention / FFN
+    for (int il = 0; il < g.n_layers; ++il)
+        for (int half = 0; half < 2; ++half) {
+            const size_t o = ((size_t) il * 2 + half) * g.n_embd;
+            double d = 0, n = 0;
+            for (int e = 0; e < g.n_embd; ++e) {
+                d += (double) (cap_a[o + e] - cap_b[o + e]) * (cap_a[o + e] - cap_b[o + e]);
+                n += (double) cap_b[o + e] * cap_b[o + e];
+            }
+            std::fprintf(stderr, "seam L%d %s: rel diff %.3e  |x| %.1f\n", il, half ? "ffn " : "attn",
+                         std::sqrt(d / std::max(n, 1e-30)), std::sqrt(n));
+        }
+    if (!continue_greedy(sb, b)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    double mx = 0;
+    for (size_t i = 0; i < a.size(); ++i) mx = std::max(mx, (double) std::fabs(a[i] - b[i]));
+    std::vector<std::pair<int, float>> ta, tb;
+    float lp;
+    summarize(a, top_n, -1, ta, lp);
+    summarize(b, top_n, -1, tb, lp);
+    print_top("batched", (int) toks.size() - 1, ta, -1, 0);
+    print_top("stepwise", (int) toks.size() - 1, tb, -1, 0);
+    int same = 0;
+    while (same < (int) sa.size() && same < (int) sb.size() && sa[(size_t) same] == sb[(size_t) same]) ++same;
+    std::printf("{\"prompt\":%zu,\"batched_ms\":%.0f,\"stepwise_ms\":%.0f,\"max_abs_logit_diff\":%.4f,"
+                "\"greedy_agree\":%d,\"of\":%d}\n",
+                toks.size(), ms_a, ms_b, mx, same, gen);
+    std::printf("{\"batched_gen\":[");
+    for (size_t i = 0; i < sa.size(); ++i) std::printf("%s%d", i ? "," : "", sa[i]);
+    std::printf("],\"stepwise_gen\":[");
+    for (size_t i = 0; i < sb.size(); ++i) std::printf("%s%d", i ? "," : "", sb[i]);
+    std::printf("]}\n");
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string model, tokens_arg, tokens_file;
     int64_t ctx = 4096;
     int dev = -1, gen = 0, top_n = 5;
-    bool eval = false, serve_mode = false;
+    bool eval = false, serve_mode = false, check = false, batched = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const auto next = [&]() -> std::string {
@@ -271,6 +383,8 @@ int main(int argc, char** argv) {
         else if (a == "--top") top_n = std::atoi(next().c_str());
         else if (a == "--eval") eval = true;
         else if (a == "--serve") serve_mode = true;
+        else if (a == "--prefill-check") check = true;
+        else if (a == "--batched") batched = true;
         else if (a == "--max-context") ctx = std::atoll(next().c_str());
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
@@ -296,6 +410,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (serve_mode) return serve(m);
+    if (check) return prefill_check(m, toks, gen > 0 ? gen : 16, top_n);
     const auto& g = m.geometry();
     std::fprintf(stderr, "glm-dsa: %d layers, n_embd %d, %d experts top-%d, device %d, ctx %lld\n", g.n_layers,
                  g.n_embd, g.n_expert, g.n_exp_used, m.device(), (long long) ctx);
@@ -304,7 +419,19 @@ int main(int argc, char** argv) {
     std::vector<std::pair<int, float>> top;
     double nll = 0;
     int n_nll = 0;
-    for (size_t i = 0; i < toks.size(); ++i) {
+    if (batched && !eval) {   // the prompt through the batched path, then the head of its last token
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!m.prefill(toks.data(), (int64_t) toks.size(), err, true) || !m.read_logits(logits.data(), err)) {
+            std::fprintf(stderr, "prefill failed: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "prefill: %zu tokens in %.0f ms\n", toks.size(),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        float lp = 0;
+        summarize(logits, top_n, -1, top, lp);
+        print_top("pos", (int) toks.size() - 1, top, -1, 0);
+    }
+    for (size_t i = 0; i < toks.size() && !(batched && !eval); ++i) {
         const bool last = i + 1 == toks.size();
         if (!m.step(toks[i], (eval || last) ? logits.data() : nullptr, err)) {
             std::fprintf(stderr, "step %zu failed: %s\n", i, err.c_str());

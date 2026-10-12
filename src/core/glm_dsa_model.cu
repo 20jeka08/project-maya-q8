@@ -11,6 +11,7 @@
 
 #include "ggml.h"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -381,6 +382,7 @@ void GlmCpuPool::run(int n, const std::function<void(int)>& fn) {
 
 GlmDsaModel::~GlmDsaModel() {
     if (!allocs_.empty() || cache_) cudaSetDevice(dev_);
+    if (cublas_) cublasDestroy((cublasHandle_t) cublas_);
     for (void* p : allocs_) cudaFree(p);
     for (auto& e : experts_) delete (strata::kernels::cpu::NativeFmt*) e.fmt;
 }
@@ -575,6 +577,8 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
     allocs_.push_back(d_cells_);
     GD_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
     allocs_.push_back(d_tok_);
+    GD_CHECK(cudaMalloc(&d_logits_buf_, (size_t) g.n_vocab * sizeof(float)));
+    allocs_.push_back(d_logits_buf_);
 
     int threads = (int) std::thread::hardware_concurrency() / 2;
     if (const char* s = std::getenv("STRATA_GLM_THREADS")) threads = std::atoi(s);
@@ -635,6 +639,13 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
 }
 
 bool GlmDsaModel::gemv(const DevW& w, const float* x, float* y, std::string& err) {
+    // STRATA_GLM_F32_GEMV=1 (a check, not a mode): the quantized weights expanded and multiplied in FP32 exactly as
+    // the batched path does, so the two paths can be compared without the Q8_1 activation rounding between them
+    static const bool f32_gemv = std::getenv("STRATA_GLM_F32_GEMV") && std::atoi(std::getenv("STRATA_GLM_F32_GEMV"));
+    if (f32_gemv && w.type != 0 && &w != &w_.at("output.weight")) {
+        if (!pf_alloc(err)) return false;
+        return gemm(w, x, y, 1, err);
+    }
     if (w.type == 0) {
         gemv_f32_kernel<<<nblk(w.n_out * 32), T_>>>((const float*) w.d, x, y, (int) w.n_out, (int) w.n_in);
     } else {
@@ -721,7 +732,7 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
     float* iq = hh + g.n_ff_dense;
     float* iw = iq + (size_t) g.idx_heads * g.idx_key;
     float* score = iw + 64;
-    float* d_logits = score + max_ctx_;
+    float* d_logits = d_logits_buf_;
 
     // the embedding row, dequantized on the host from the mmap
     {
@@ -798,6 +809,7 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
         GD_CHECK(cudaGetLastError());
         if (!gemv(W(il, "attn_output.weight"), o, tmp, err)) return false;
         add_kernel<<<nblk(g.n_embd), T_>>>(x, tmp, g.n_embd);
+        capture(il, 0, x);
 
         // ---- the FFN
         rms_norm_kernel<<<1, T_>>>(x, (const float*) W(il, "ffn_norm.weight").d, xn, g.n_embd, g.norm_eps);
@@ -816,6 +828,7 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
             GD_CHECK(cudaMemcpy(h_ids.data(), ids, h_ids.size() * sizeof(int), cudaMemcpyDeviceToHost));
             GD_CHECK(cudaMemcpy(h_rw.data(), rw, h_rw.size() * sizeof(float), cudaMemcpyDeviceToHost));
             GD_CHECK(cudaMemcpy(h_x_.data(), xn, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToHost));
+            capture_ids(il, h_ids.data(), h_rw.data());
             // the shared expert runs on the device while the CPU does the routed ones
             if (!gemv(W(il, "ffn_gate_shexp.weight"), xn, gate, err) ||
                 !gemv(W(il, "ffn_up_shexp.weight"), xn, up, err))
@@ -830,6 +843,7 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
             add_kernel<<<nblk(g.n_embd), T_>>>(moe, sh, g.n_embd);   // moe_out + shexp, then the residual
             add_kernel<<<nblk(g.n_embd), T_>>>(x, moe, g.n_embd);
         }
+        capture(il, 1, x);
     }
 
     if (logits || head) {
@@ -845,6 +859,16 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
     t_total_ += total;
     t_cpu_ += cpu_ms;
     t_dev_ += total - cpu_ms;
+    return true;
+}
+
+bool GlmDsaModel::read_logits(float* out, std::string& err) {
+    if (!d_logits_) {
+        err = "glm-dsa: no head has run";
+        return false;
+    }
+    GD_CHECK(cudaSetDevice(dev_));
+    GD_CHECK(cudaMemcpy(out, d_logits_, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost));
     return true;
 }
 

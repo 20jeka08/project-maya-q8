@@ -27,6 +27,7 @@
 #include "strata/kernels/sampler.hpp"
 
 #include <atomic>
+#include <cuda_runtime.h>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -95,8 +96,25 @@ public:
     /// written there) or when `head` is set (the logits stay on the device for sample()); otherwise it is skipped -
     /// a teacher-forced prompt only needs the last one.
     bool step(int32_t token, float* logits, std::string& err, bool head = false);
+    /// Appends n tokens, batched in chunks of up to STRATA_GLM_CHUNK (512): per layer the dense projections and the
+    /// attention are cuBLAS FP32 GEMMs over the chunk (the Q8_0 weights expanded on the device), and the routed
+    /// experts run on the CPU grouped by expert, so each selected expert's weights are read once a chunk instead
+    /// of once a token.  The head runs for the last token when `head` (logits on the device, for sample()).
+    /// `progress(done, n)` after each chunk.
+    bool prefill(const int32_t* toks, int64_t n, std::string& err, bool head,
+                 const std::function<void(int64_t, int64_t)>& progress = {});
     /// One token from the last head's logits (greedy when sp.greedy or temperature <= 0); -1 with `err` on failure.
     int sample(const strata::kernels::SamplerParams& sp, std::string& err);
+    /// A check: record the residual of the last token processed after each layer's attention and after its FFN
+    /// (2 x n_layers x n_embd floats, layer-major), by step() and by prefill() alike.
+    void set_capture(bool on) {
+        capture_ = on;
+        if (on) cap_.assign((size_t) 2 * g_.n_layers * g_.n_embd, 0.0f), cap_ids_.assign((size_t) g_.n_layers * 2 * g_.n_exp_used, -1);
+    }
+    const std::vector<float>& captured_ids() const { return cap_ids_; }   ///< per layer: k ids then k weights
+    const std::vector<float>& captured() const { return cap_; }
+    /// Copies the last head's n_vocab logits to the host.
+    bool read_logits(float* out, std::string& err);
     /// Forgets the sequence (the caches are overwritten from position 0).
     void reset() { pos_ = 0; }
     /// Keeps the first `pos` positions and forgets the rest (the caches are append-only by position, so the cells
@@ -130,6 +148,11 @@ private:
     bool gemv(const DevW& w, const float* x, float* y, std::string& err);
     const DevW& W(int il, const char* suffix) const;
     bool moe_cpu(int il, const std::vector<int>& ids, const std::vector<float>& rw, std::string& err);
+    // the batched path (src/core/glm_dsa_prefill.cu)
+    bool pf_alloc(std::string& err);
+    bool prefill_chunk(const int32_t* toks, int T, bool head, std::string& err);
+    bool gemm(const DevW& w, const float* X, float* Y, int T, std::string& err);
+    bool moe_cpu_batch(int il, int T, const int* ids, const float* rw, std::string& err);
 
     GlmDsaGeometry g_;
     int dev_ = 0;
@@ -149,6 +172,7 @@ private:
     void* q8_ = nullptr;          ///< the Q8_1 activation scratch
     int* d_cells_ = nullptr;
     float* d_logits_ = nullptr;   ///< the last head's logits (device)
+    float* d_logits_buf_ = nullptr;
     int* d_tok_ = nullptr;        ///< the sampler's output (device)
     std::vector<int> cells_;      ///< the current selection (host copy), reused by shared layers
     std::vector<float> h_score_;
@@ -158,6 +182,36 @@ private:
     std::vector<float> h_x_, h_moe_, h_ff_, h_dn_;
     std::vector<uint8_t> h_act_, h_hq_;
     std::vector<float> h_embd_;
+
+    // the batched path's state (allocated by the first prefill)
+    void* cublas_ = nullptr;
+    int pf_chunk_ = 0, pf_sub_ = 0;
+    float* pf_ = nullptr;          ///< chunk activations
+    float* deq_ = nullptr;         ///< one weight expanded to F32
+    size_t deq_floats_ = 0;
+    float* att_ = nullptr;         ///< attention / indexer score blocks
+    float* pf_score_ = nullptr;    ///< the indexer's per-query scores (chunk x max_ctx)
+    uint8_t* d_mask_ = nullptr;    ///< the selection, chunk x max_ctx (1 = attended)
+    std::vector<uint8_t> h_mask_;
+    std::vector<float> hb_x_, hb_ff_, hb_dn_, hb_moe_, hb_rw_, hb_score_;
+    std::vector<int> hb_ids_;
+    std::vector<uint8_t> hb_act_, hb_hq_;
+
+    bool capture_ = false;
+    std::vector<float> cap_;
+    std::vector<float> cap_ids_;
+    void capture_ids(int il, const int* ids, const float* rw) {
+        if (!capture_) return;
+        for (int i = 0; i < g_.n_exp_used; ++i) {
+            cap_ids_[((size_t) il * 2) * g_.n_exp_used + i] = (float) ids[i];
+            cap_ids_[((size_t) il * 2 + 1) * g_.n_exp_used + i] = rw[i];
+        }
+    }
+    void capture(int il, int half, const float* dev_row) {
+        if (capture_)
+            cudaMemcpy(cap_.data() + ((size_t) il * 2 + half) * g_.n_embd, dev_row, (size_t) g_.n_embd * sizeof(float),
+                       cudaMemcpyDeviceToHost);
+    }
 
     double t_dev_ = 0, t_cpu_ = 0, t_total_ = 0;
 };
