@@ -1,4 +1,4 @@
-﻿// src/core/glm_fast_path.cu - the glm5-next FAST decode path (Glm5Model members).
+// src/core/glm_fast_path.cu - the glm5-next FAST decode path (Glm5Model members).
 //
 // The same model as Glm5Model::step_layers (the correctness-first reference, STRATA_GLM_SLOW=1), run
 // as ~11 fused launches per layer (strata/kernels/glm_fast.hpp) on a private non-blocking stream per
@@ -1355,26 +1355,11 @@ bool Glm5Model::fast_setup(std::string& err) {
                     break;
                 }
                 const cudaError_t ce = cudaHostAlloc(&p, (size_t) n * R.stride, cudaHostAllocPortable);
-                if (ce == cudaSuccess) {
-                    // ... and leave room under the cap: a pageable copy needs pinned buffers of the driver's own, and
-                    // with two tiers pinned right up to it the warmed tables' upload failed (#105).  512 MB more that
-                    // will not pin: a step less
-                    void* room = nullptr;
-                    if (cudaHostAlloc(&room, (size_t) 512 << 20, cudaHostAllocDefault) == cudaSuccess) {
-                        cudaFreeHost(room);
-                        break;
-                    }
-                    cudaGetLastError();
-                    cudaFreeHost(p);
-                    // say what gave way, at the size: the machine's pinning cap, not a config mistake, and the
-                    // shrink below used to hide it entirely (a 2-GPU split lost ~140 GiB a part with 470 GB of
-                    // RAM and 640 GB of commit free, and nothing in the log said so)
-                    std::fprintf(stderr, "glm fast: CUDA%d pinned tier: %.1f GiB pinned, but no room under the cap - shrinking\n",
-                                 dev_, (double) ((size_t) n * R.stride) / 1073741824.0);
-                } else {
-                    std::fprintf(stderr, "glm fast: CUDA%d pinned tier: %.1f GiB refused: %s\n", dev_,
-                                 (double) ((size_t) n * R.stride) / 1073741824.0, cudaGetErrorString(ce));
-                }
+                if (ce == cudaSuccess) break;   // no headroom probe: freeing and re-allocating a ~128 GiB tier on a
+                    // probe failure degrades the adapter's pinning budget for the whole session on this driver -
+                    // one failed start then makes every later start fail too, until a reboot
+                std::fprintf(stderr, "glm fast: CUDA%d pinned tier: %.1f GiB refused: %s\n", dev_,
+                             (double) ((size_t) n * R.stride) / 1073741824.0, cudaGetErrorString(ce));
                 cudaGetLastError();
                 p = nullptr;
                 const int64_t less = tries < 4 ? n * 31 / 32 : n * 7 / 8;
