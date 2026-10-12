@@ -1760,7 +1760,10 @@ def server_command(cfg_path: Path, a) -> tuple:
     select_build_backend(cfg.get("backend", "cuda"))
     args = cfg.get("args") or []
     pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
-    for p, what in ((Path(cfg.get("exe", "")), "the engine"), (pack, "the pack"),
+    # GLM-5.3 (glm_dsa_run) reads its GGUF shards directly: --model instead of a pack
+    gguf = Path(args[args.index("--model") + 1]) if pack is None and "--model" in args[:-1] else None
+    for p, what in ((Path(cfg.get("exe", "")), "the engine"),
+                    (gguf, "the model's GGUF") if gguf is not None else (pack, "the pack"),
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
         if p is None or not p.exists():
             fail(f"{cfg_path.name}: {what} is missing ({p})", f"run {ME} --setup to repair it")
