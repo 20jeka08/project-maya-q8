@@ -24,6 +24,7 @@
 #pragma once
 
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -90,11 +91,18 @@ public:
     /// to device `dev` (-1: the device with the most memory) and sizes the caches for `max_ctx` tokens.
     bool load(const std::string& gguf_path, int64_t max_ctx, int dev, std::string& err);
 
-    /// Appends one token at the next position; when `logits` is non-null the head runs and its n_vocab floats are
-    /// written there (the head is skipped otherwise - a teacher-forced prompt only needs the last one).
-    bool step(int32_t token, float* logits, std::string& err);
+    /// Appends one token at the next position.  The head runs when `logits` is non-null (its n_vocab floats are
+    /// written there) or when `head` is set (the logits stay on the device for sample()); otherwise it is skipped -
+    /// a teacher-forced prompt only needs the last one.
+    bool step(int32_t token, float* logits, std::string& err, bool head = false);
+    /// One token from the last head's logits (greedy when sp.greedy or temperature <= 0); -1 with `err` on failure.
+    int sample(const strata::kernels::SamplerParams& sp, std::string& err);
     /// Forgets the sequence (the caches are overwritten from position 0).
     void reset() { pos_ = 0; }
+    /// Keeps the first `pos` positions and forgets the rest (the caches are append-only by position, so the cells
+    /// past `pos` are simply overwritten) - a prompt that extends the previous conversation reuses its prefix.
+    void rewind(int64_t pos) { pos_ = pos < pos_ ? (pos < 0 ? 0 : pos) : pos_; }
+    int64_t max_ctx() const { return max_ctx_; }
     int64_t pos() const { return pos_; }
     const GlmDsaGeometry& geometry() const { return g_; }
     int device() const { return dev_; }
@@ -140,6 +148,8 @@ private:
     float* sc_ = nullptr;         ///< scratch arena
     void* q8_ = nullptr;          ///< the Q8_1 activation scratch
     int* d_cells_ = nullptr;
+    float* d_logits_ = nullptr;   ///< the last head's logits (device)
+    int* d_tok_ = nullptr;        ///< the sampler's output (device)
     std::vector<int> cells_;      ///< the current selection (host copy), reused by shared layers
     std::vector<float> h_score_;
 

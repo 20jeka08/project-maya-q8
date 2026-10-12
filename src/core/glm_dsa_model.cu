@@ -7,6 +7,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/router_sigmoid.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include "ggml.h"
 
@@ -572,6 +573,8 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
     allocs_.push_back(q8_);
     GD_CHECK(cudaMalloc(&d_cells_, (size_t) g.idx_top_k * sizeof(int)));
     allocs_.push_back(d_cells_);
+    GD_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
+    allocs_.push_back(d_tok_);
 
     int threads = (int) std::thread::hardware_concurrency() / 2;
     if (const char* s = std::getenv("STRATA_GLM_THREADS")) threads = std::atoi(s);
@@ -583,6 +586,50 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
     h_act_.resize(strata::kernels::cpu::kNativeActBytes);
     h_hq_.resize((size_t) g.n_exp_used * strata::kernels::cpu::kNativeHBytes);
     h_embd_.resize((size_t) g.n_embd);
+
+    // 6. warm the routed experts: every page read once, in parallel.  Decode touches ~600 random experts a token;
+    //    a page that is not resident costs a disk read, and one resident in the file cache but not yet mapped
+    //    into this process costs a soft fault - measured 340-1500 ms a token against 138 ms once all of them are
+    //    mapped (glm_dsa_moe_bench, EPYC 7K62 8x DDR4-2933: 99.6 GB/s).  STRATA_GLM_WARM=0 skips it.
+    const char* warm_env = std::getenv("STRATA_GLM_WARM");
+    if (!warm_env || std::atoi(warm_env) != 0) {
+        struct Span {
+            const uint8_t* p;
+            size_t n;
+        };
+        std::vector<Span> spans;
+        constexpr size_t CH = (size_t) 64 << 20;
+        size_t total = 0;
+        for (const ExpertLayer& e : experts_) {
+            if (!e.fmt) continue;
+            const size_t gb = e.gu_expert * (size_t) g.n_expert, db = e.d_expert * (size_t) g.n_expert;
+            const Span whole[3] = {{e.gate, gb}, {e.up, gb}, {e.down, db}};
+            for (const Span& w : whole)
+                for (size_t o = 0; o < w.n; o += CH) spans.push_back({w.p + o, std::min(CH, w.n - o)});
+            total += 2 * gb + db;
+        }
+        std::atomic<uint64_t> sink{0}, done{0};
+        std::atomic<int> shown{0};
+        const auto w0 = std::chrono::steady_clock::now();
+        pool_->run((int) spans.size(), [&](int i) {
+            uint64_t s = 0;
+            for (size_t o = 0; o < spans[(size_t) i].n; o += 4096) s += spans[(size_t) i].p[o];
+            sink += s;
+            const uint64_t d = done += spans[(size_t) i].n;
+            const int pct = (int) (d * 10 / total);
+            int prev = shown.load();
+            while (pct > prev && !shown.compare_exchange_weak(prev, pct)) {}
+            if (pct > prev) {
+                const double sec =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+                std::fprintf(stderr, "glm-dsa: experts warm %d%% (%.0f of %.0f GB, %.0f s)\n", pct * 10, d / 1e9,
+                             total / 1e9, sec);
+            }
+        });
+        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - w0).count();
+        std::fprintf(stderr, "glm-dsa: %.0f GB of experts mapped in %.0f s (%.2f GB/s)%s\n", total / 1e9, sec,
+                     total / 1e9 / sec, sink.load() == 1 ? " " : "");
+    }
     pos_ = 0;
     return true;
 }
@@ -639,7 +686,7 @@ bool GlmDsaModel::moe_cpu(int il, const std::vector<int>& ids, const std::vector
     return true;
 }
 
-bool GlmDsaModel::step(int32_t token, float* logits, std::string& err) {
+bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head) {
     const GlmDsaGeometry& g = g_;
     if (pos_ >= max_ctx_) {
         err = "glm-dsa: context full (" + std::to_string(max_ctx_) + " tokens)";
@@ -785,10 +832,12 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err) {
         }
     }
 
-    if (logits) {
+    if (logits || head) {
         rms_norm_kernel<<<1, T_>>>(x, (const float*) w_.at("output_norm.weight").d, xn, g.n_embd, g.norm_eps);
         if (!gemv(w_.at("output.weight"), xn, d_logits, err)) return false;
-        GD_CHECK(cudaMemcpy(logits, d_logits, (size_t) g.n_vocab * sizeof(float), cudaMemcpyDeviceToHost));
+        d_logits_ = d_logits;
+        if (logits)
+            GD_CHECK(cudaMemcpy(logits, d_logits, (size_t) g.n_vocab * sizeof(float), cudaMemcpyDeviceToHost));
     }
     GD_CHECK(cudaDeviceSynchronize());
     ++pos_;
@@ -797,6 +846,27 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err) {
     t_cpu_ += cpu_ms;
     t_dev_ += total - cpu_ms;
     return true;
+}
+
+int GlmDsaModel::sample(const strata::kernels::SamplerParams& sp, std::string& err) {
+    if (!d_logits_) {
+        err = "glm-dsa: sample() before any head ran";
+        return -1;
+    }
+    if (cudaSetDevice(dev_) != cudaSuccess) {
+        err = "glm-dsa: cudaSetDevice failed";
+        return -1;
+    }
+    strata::kernels::SamplerParams p = sp;
+    if (p.temperature <= 0.0f) p.greedy = true;
+    strata::kernels::sample_tokens(d_logits_, 1, g_.n_vocab, nullptr, 0, p, d_tok_, cudaStreamLegacy);
+    int tok = -1;
+    const cudaError_t e = cudaMemcpy(&tok, d_tok_, sizeof(int), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        err = std::string("glm-dsa: sample: ") + cudaGetErrorString(e);
+        return -1;
+    }
+    return tok;
 }
 
 void GlmDsaModel::take_timing(double& dev_ms, double& cpu_ms, double& total_ms) {

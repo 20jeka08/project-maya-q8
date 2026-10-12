@@ -356,6 +356,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(glm_dsa_run src/program/glm_dsa_run.cpp)
   target_include_directories(glm_dsa_run PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_dsa_run PRIVATE strata_engine strata_prefill ${_strata_gpu_runtime_target})
+  add_executable(glm_dsa_moe_bench src/program/glm_dsa_moe_bench.cpp)
+  target_link_libraries(glm_dsa_moe_bench PRIVATE strata_engine ${_strata_gpu_runtime_target})
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
