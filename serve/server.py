@@ -582,7 +582,7 @@ class StrataEngine:
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune, tune_keys = sampling.get("strata_tune"), ""
         if isinstance(tune, dict):
-            for k in ("pcie_frac", "spec_min_p"):
+            for k in ("pcie_frac", "spec_min_p", "spec_cum"):
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     tune_keys += f" {k}={float(v)!r}"
@@ -592,6 +592,12 @@ class StrataEngine:
             rc = tune.get("read_chunks")   # ... and the pieces it reads an expert from the SSD in (x3)
             if isinstance(rc, int) and not isinstance(rc, bool) and 1 <= rc <= 16:
                 tune_keys += f" read_chunks={rc}"
+            sw = tune.get("spec")   # the GLM engine's DFlash decode: its verify window (the anchor and drafts), 2..16;
+            if isinstance(sw, int) and not isinstance(sw, bool) and 1 <= sw <= 16:   # 1: no drafting (the token loop)
+                tune_keys += f" spec={sw}"
+            sn = tune.get("spec_n_min")   # ... drafts it keeps whatever their confidence
+            if isinstance(sn, int) and not isinstance(sn, bool) and 0 <= sn <= 15:
+                tune_keys += f" spec_n_min={sn}"
         if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic)
@@ -1199,6 +1205,9 @@ class Service:
         self.stopping = False            # the server is ending: a request still queued is refused, not started
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        # pages on OTHER origins allowed to call /v1/* from a browser (CORS; the config's "cors_origins"): exact origins
+        # like "http://127.0.0.1:8090", or "*" for every page.  Empty = no CORS headers at all.
+        self.cors_origins: list[str] = []
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
         self.active = 0                                 # requests with the engine now (several: READY multi=<n>)
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
@@ -1459,6 +1468,7 @@ class Service:
             s = dict(self.status)
             hist = list(self.history)
             totals = dict(self.totals)
+            active = self.active
         now = time.time()
         progress = getattr(self.engine, "progress", None)
         if s.get("busy") and s.get("first_token") is None:
@@ -1467,7 +1477,8 @@ class Service:
             state = "generating"
         else:
             state = "idle"
-        live = {"state": state, "queued": s.get("queued", 0), "phase": s.get("phase") if s.get("busy") else None,
+        live = {"state": state, "queued": s.get("queued", 0), "active": active,   # (answering at once: --parallel)
+                "phase": s.get("phase") if s.get("busy") else None,
                 "prompt_tokens": s.get("prompt_tokens") if s.get("busy") else None,
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
                 "max_tokens": s.get("max_tokens") if s.get("busy") else None,
@@ -1503,8 +1514,10 @@ class Service:
         with self.status_lock:
             s, totals = dict(self.status), dict(self.totals)
             last_t, last_at = (dict(self.last_timings) if self.last_timings else None), self.last_request_at
+            active = self.active
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "static": {}}
         hw, static = tel.get("now") or {}, tel.get("static") or {}
+        places = max(1, int(getattr(self.engine, "multi", 0) or 0))   # requests the engine answers at once
 
         def scaled(v, unit, digits=0):
             return round(v / unit, digits) if isinstance(v, (int, float)) else None
@@ -1517,10 +1530,11 @@ class Service:
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
-            "concurrency": {"serving": 1, "requested": 1},       # one request at a time; more wait their turn
+            "concurrency": {"serving": places, "requested": places},   # more than that wait their turn
             "dialects": ["/v1/chat/completions", "/v1/messages"],
             "vision": {"enabled": images, "available": images, "error": None},
-            "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
+            "activity": {"requests": totals["requests"] + max(int(busy), active),
+                         "in_flight": max(int(busy), active) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
             "last_timings": last_t,
             "machine": {
@@ -2415,6 +2429,16 @@ def key_list(value) -> list[str]:
     return [k.strip() for k in str(value).split(",") if k.strip()]
 
 
+def parse_cors_origins(value) -> list[str]:
+    """The config's "cors_origins": a list of page origins such as "http://127.0.0.1:8090" (or ["*"]) -> the list
+    without trailing slashes; missing or empty = none (no CORS headers at all).  A ValueError says what is wrong."""
+    if value is None or value == "":
+        return []
+    if not isinstance(value, list) or not all(isinstance(o, str) and o.strip() for o in value):
+        raise ValueError('"cors_origins" must be a list of origins like "http://127.0.0.1:8090" (or ["*"])')
+    return [o.strip().rstrip("/") for o in value]
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
@@ -2475,6 +2499,37 @@ def make_handler(svc: Service):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _cors_allow(self):
+            """The Access-Control-Allow-Origin value for this request, or None: only /v1/* paths and only an origin the
+            config's cors_origins lists (or "*")."""
+            if not svc.cors_origins or not self.path.split("?")[0].startswith("/v1/"):
+                return None
+            if "*" in svc.cors_origins:
+                return "*"
+            origin = (self.headers.get("Origin") or "").rstrip("/")
+            return origin if origin and origin in svc.cors_origins else None
+
+        def end_headers(self):
+            # every answer (JSON, a stream, an error) to an allowed page carries the CORS header - one place for all
+            allow = self._cors_allow()
+            if allow:
+                self.send_header("Access-Control-Allow-Origin", allow)
+                if allow != "*":
+                    self.send_header("Vary", "Origin")
+            super().end_headers()
+
+        def do_OPTIONS(self):
+            # a CORS preflight: no credentials come with it, so no API key; granted only for cors_origins
+            allow = self._cors_allow()
+            self.send_response(204 if allow else 403)
+            if allow:
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                asked = self.headers.get("Access-Control-Request-Headers")
+                self.send_header("Access-Control-Allow-Headers", asked or "Content-Type, Authorization, x-api-key")
+                self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def _authorized(self) -> bool:
             if not svc.api_key:
@@ -2694,7 +2749,8 @@ def make_handler(svc: Service):
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
-            server never grants) and no foreign Origin: a web page elsewhere must not change settings or run tools."""
+            server grants only to the config's cors_origins and only on /v1/*) and no foreign Origin: a web page
+            elsewhere must not change settings or run tools."""
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return False
@@ -3171,7 +3227,7 @@ def main() -> int:
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     if getattr(engine, "multi", 0) > 1:                 # n conversations at once: n places in the FIFO
         svc.fifo.set_capacity(engine.multi)
-        print(f"[maya] {engine.multi} conversations at once (STRATA_GLM_SEQS)", flush=True)
+        print(f"[maya] {engine.multi} conversations at once (--parallel)", flush=True)
     if cfg.get("reasoning_effort"):
         try:
             effort_kwargs(cfg["reasoning_effort"])
@@ -3185,6 +3241,12 @@ def main() -> int:
     if svc.think_budget:
         print(f"[maya] thinking budget: {svc.think_budget} tokens (then the answer)", flush=True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
+    try:
+        svc.cors_origins = parse_cors_origins(cfg.get("cors_origins"))
+    except ValueError as e:
+        raise SystemExit(f"config: {e}")
+    if svc.cors_origins:
+        print("[maya] browser pages allowed to call /v1/* (CORS): " + ", ".join(svc.cors_origins), flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     if a.config:

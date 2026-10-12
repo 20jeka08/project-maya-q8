@@ -237,6 +237,7 @@ struct Options {
     /// routes to is streamed once per chunk, so a bigger chunk streams fewer bytes per token (the "ubatch" effect).
     bool prefill_auto = false;
     std::string prefill_arg;           ///< `--prefill` as given (the GLM engine reads it as STRATA_GLM_PREFILL)
+    std::string dflash;                ///< `--dflash`: a DFlash2 draft GGUF for the GLM engine (STRATA_GLM_DFLASH)
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
@@ -267,6 +268,7 @@ struct Options {
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
+    bool spec_min_p_set = false;   ///< --spec-min-p given (the DFlash decode's default cut is 0.9 otherwise)
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;
     bool eos_given = false;    ///< --stop-eos or --eos-ids appeared: the glm path stops only when asked (defaults are qwen's)
@@ -322,11 +324,21 @@ void usage() {
                  "  --pack DIR           the pack directory (default pack/full)\n"
                  "  --glm-pack DIR       a GLM-5.3-Flash pack (M3.1): the verified Glm5Model runner behind the\n"
                  "                       same wire contract (T <id> / DONE; --serve reads GEN lines)\n"
+                 "  --dflash GGUF        (--glm-pack) draft with a DFlash2 block drafter made for the model: each\n"
+                 "                       round it drafts up to --spec T - 1 tokens (default its block size - 1), one\n"
+                 "                       verify window checks them; --spec-min-p P stops a draft at a selector\n"
+                 "                       confidence below P (default 0.5 on 3+ GPUs, 0.95 on one; two GPUs: at\n"
+                 "                       least one draft, up to 4 while the confidences' product stays at 0.9 -\n"
+                 "                       STRATA_GLM_DFLASH_MIN / _CUM).  The model's\n"
+                 "                       MTP block is not loaded with it.  Env: STRATA_GLM_DFLASH\n"
                  "  --glm-ram-resident   the pinned RAM tier holds every expert VRAM does not, and nothing is evicted\n"
                  "                       to disk. The start fails if the tier cannot hold them (raise STRATA_GLM_RAM_GB\n"
                  "                       or lower --max-context). Env: STRATA_GLM_RAM_RESIDENT=1\n"
                  "  --glm-ram-slack N    extra RAM-tier slots per MoE layer (STRATA_GLM_RAM_SLACK; default 16 when\n"
                  "                       resident, 0 otherwise)\n"
+                 "  --parallel N         --serve: up to N requests decode at once (1-8, default 1). One GPU decodes\n"
+                 "                       them together (each weight read once for all); a split pipelines them\n"
+                 "                       across its cards. Each extra conversation keeps its own context state\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --ple-gguf PATH      required PLE table (original second GGUF shard)\n"
@@ -966,6 +978,8 @@ static int glm_pack_generate(const Options& o) {
     // the prompt chunk, set in the config's args like Strata's: --prefill auto | N (a chunk of N tokens) | 0
     // (the engine reads it as STRATA_GLM_PREFILL; without either, auto)
     if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
+    // the DFlash2 drafter (--dflash, else STRATA_GLM_DFLASH): loaded with the model, on the device of its head
+    if (!o.dflash.empty()) set_env("STRATA_GLM_DFLASH", o.dflash.c_str());
     // the layer split across the visible GPUs: STRATA_GLM_SPLIT, else --layer-split (auto | K1,K2,..)
     if (!model.load_pack_env(o.glm_pack, o.max_context, err, o.layer_split)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
@@ -979,12 +993,12 @@ static int glm_pack_generate(const Options& o) {
         const auto st = model.fast_stats();
         // (+ the CPU lane setup's calibration reads: its threads and its PCIe share, as the engine started)
         std::printf("INFO context=%lld kv=%s expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast experts=%d "
-                    "vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d vision_lend=%zu cpu_threads=%d "
+                    "vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d vision_lend=%zu cpu_threads=%d "
                     "pcie_share=%.2f\n",
                     (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
-                    model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share());
+                    model.dflash_ready() ? 1 : 0, model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share());
     }
 
     strata::kernels::SamplerParams sp;
@@ -1359,6 +1373,11 @@ static int glm_pack_generate(const Options& o) {
         note(m);
         return len;
     };
+    // a request's DFlash window and draft cut (its GEN line's spec= / spec_min_p=; 0 / -1: as the engine started)
+    int req_spec = 0;
+    double req_spec_min_p = -1.0;
+    int req_spec_n_min = -1;       // ... its drafts kept whatever their confidence (spec_n_min=; -1: the engine's)
+    double req_spec_cum = -1.0;    // ... and the cut on the product of the confidences (spec_cum=; -1: the engine's)
     // THE PROMPT of a request (run_request, and the several-conversation scheduler's admission): the conversation
     // reuse (the snapshot, else a slot), the prompt path for all but the last token, the token path for the rest - the
     // state saved before the last token and the first sample's logits on the tail.  0, or 1 after an ERR line.
@@ -1629,7 +1648,23 @@ static int glm_pack_generate(const Options& o) {
             return produced < max_new;
         };
         const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;
-        if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
+        if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.dflash_ready() && req_spec != 1) {
+            // the DFlash decode: a block of drafts a round, one verify window checks them (same tokens as the loop
+            // below for the same samples); --spec T caps a round's window at T tokens
+            int64_t n_spec = 0;
+            const int spec = req_spec >= 2 ? req_spec : o.spec;   // this request's window, else --spec
+            const int n_max = spec >= 2 ? spec - 1 : -1;            // -1: the engine's (decode_dflash)
+            // the drafts stop at a selector confidence below the cut: the request's, else --spec-min-p, else the
+            // engine's (-1: decode_dflash picks it for the window it verifies with)
+            const float p_min = req_spec_min_p >= 0.0 && req_spec_min_p <= 1.0 ? (float) req_spec_min_p
+                                : o.spec_min_p_set                         ? (float) o.spec_min_p
+                                                                           : -1.0f;
+            if (!model.decode_dflash(sp, max_new, n_max, p_min, on_token, n_spec, err, req_spec_n_min,
+                                     req_spec_cum >= 0.0 && req_spec_cum <= 1.0 ? (float) req_spec_cum : -1.0f)) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
             // running the NextN block's draft (same tokens as the loop below)
             int64_t n_spec = 0;
@@ -1702,6 +1737,10 @@ static int glm_pack_generate(const Options& o) {
     // request alone decodes through the speculative path (the fastest for one); as soon as a second one comes, both go
     // through the pipelined decode (Glm5Model::multi_issue), each card of the split on a different conversation.
     const bool multi = o.serve && model.fast() && model.seq_count() > 1;
+    if (multi && model.dflash_ready())
+        std::fprintf(stderr, "glm dflash: not used with STRATA_GLM_SEQS=%d - the several-conversation scheduler decodes "
+                             "without it (and without the MTP block, which --dflash leaves unloaded)\n",
+                     model.seq_count());
     struct Ctx {   // a context's driver-side state while another one is bound (the bound one's is in the globals)
         std::vector<int32_t> snap_tokens;
         uint64_t snap_img_hash = kNoImages;
@@ -2150,6 +2189,40 @@ static int glm_pack_generate(const Options& o) {
             gen_sweep();
             return;
         }
+        // a request admitted alone that the speculative path does not take: its first token, from its prompt's logits
+        if (!resolve_ready()) {
+            multi_fail(err);
+            return;
+        }
+        // ONE GPU: every request with a token to feed goes through one step together, each weight read once for all
+        if (model.rows_ok()) {
+            std::vector<Gen*> rg;
+            std::vector<int> seqs, out;
+            std::vector<int32_t> toks;
+            std::vector<strata::kernels::SamplerParams> sps;
+            for (auto& gp : gens)
+                if (!gp->done && gp->pending >= 0 && (int) rg.size() < strata::core::Glm5Model::rows_max()) {
+                    rg.push_back(gp.get());
+                    seqs.push_back(gp->ctx);
+                    toks.push_back(gp->pending);
+                    sps.push_back(gp->sp);
+                }
+            if (!rg.empty()) {
+                out.resize(rg.size());
+                if (!model.multi_rows(seqs.data(), toks.data(), sps.data(), (int) rg.size(), out.data(), err)) {
+                    multi_fail(err);
+                    return;
+                }
+                for (size_t i = 0; i < rg.size(); ++i) {   // (the step keeps the tiers' boundary itself)
+                    Gen& g = *rg[i];
+                    g.sp.counter += 1;
+                    g.pending = -1;
+                    gen_took(g, out[i]);
+                }
+            }
+            gen_sweep();
+            return;
+        }
         for (auto& gp : gens) {
             Gen& g = *gp;
             if (g.done || g.inflight || g.pending < 0) continue;
@@ -2228,26 +2301,34 @@ static int glm_pack_generate(const Options& o) {
                 return 1;
             }
         }
-        // the reference: sequence 0 alone, the classic token path
-        std::vector<int> solo;
+        // the reference: sequence 0 alone, the classic token path - once untimed first (the tiers warm up on it, as
+        // they would before any timed run; and is the token path itself repeatable here?), then timed
+        std::vector<int> solo, solo2;
         model.seq_bind_all(0);
-        model.snapshot_restore();
-        if (!model.forward({prompts[0].back()}, lg, err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
-        auto t0 = now();
-        solo.push_back(model.last_tok_);
-        while ((int) solo.size() < G) {
-            if (!model.forward({(int32_t) solo.back()}, lg, err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
-            solo.push_back(model.last_tok_);
+        double solo_s = 0;
+        strata::core::Glm5Model::FastStats st_a, st_b;   // the expert tiers over each timed phase
+        const auto tiers = [](const char* what, const strata::core::Glm5Model::FastStats& a,
+                              const strata::core::Glm5Model::FastStats& b, int tokens) {
+            const double h = (double) (b.hits - a.hits), m = (double) (b.misses - a.misses), t = std::max(1, tokens);
+            std::printf("  %s: VRAM hit %.1f%%, a token: %.1f RAM fetches, %.2f disk reads, %.1f promotions, %.1f CPU "
+                        "experts\n", what, 100.0 * h / std::max(1.0, h + m), (double) (b.ram_hits - a.ram_hits) / t,
+                        (double) (b.disk_reads - a.disk_reads) / t, (double) (b.promotions - a.promotions) / t,
+                        (double) (b.cpu_experts - a.cpu_experts) / t);
+        };
+        for (std::vector<int>* run : {&solo2, &solo}) {
+            model.snapshot_restore();
+            st_a = model.fast_stats();
+            if (!model.forward({prompts[0].back()}, lg, err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
+            const auto t0 = now();
+            run->push_back(model.last_tok_);
+            while ((int) run->size() < G) {
+                if (!model.forward({(int32_t) run->back()}, lg, err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
+                run->push_back(model.last_tok_);
+            }
+            solo_s = secs(t0, now());
+            st_b = model.fast_stats();
         }
-        const double solo_s = secs(t0, now());
-        std::vector<int> solo2;   // the reference again: is the token path itself repeatable here?
-        model.snapshot_restore();
-        if (!model.forward({prompts[0].back()}, lg, err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
-        solo2.push_back(model.last_tok_);
-        while ((int) solo2.size() < G) {
-            if (!model.forward({(int32_t) solo2.back()}, lg, err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
-            solo2.push_back(model.last_tok_);
-        }
+        const strata::core::Glm5Model::FastStats solo_a = st_a, solo_b = st_b;
         // all n through the pipelined decode
         std::vector<std::vector<int>> out((size_t) n);
         for (int s = 0; s < n; ++s) {
@@ -2257,12 +2338,26 @@ static int glm_pack_generate(const Options& o) {
             out[(size_t) s].push_back(model.last_tok_);
         }
         std::deque<int> q;
-        t0 = now();
-        for (int s = 0; s < n; ++s) {
+        st_a = model.fast_stats();
+        const auto t0 = now();
+        int since = 0, boundaries = 0;
+        const bool rows = model.rows_ok();   // one GPU: all n together, one step per token of each
+        if (rows) {
+            std::vector<int> seqs((size_t) n), next((size_t) n);
+            std::vector<int32_t> toks((size_t) n);
+            const std::vector<strata::kernels::SamplerParams> sps((size_t) n, g0);
+            for (int s = 0; s < n; ++s) seqs[(size_t) s] = s;
+            while ((int) out[0].size() < G) {
+                for (int s = 0; s < n; ++s) toks[(size_t) s] = out[(size_t) s].back();
+                if (!model.multi_rows(seqs.data(), toks.data(), sps.data(), n, next.data(), err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
+                for (int s = 0; s < n; ++s) out[(size_t) s].push_back(next[(size_t) s]);
+                ++boundaries;   // (one before every step, in the step itself)
+            }
+        }
+        for (int s = 0; s < n && !rows; ++s) {
             if (!model.multi_issue(s, out[(size_t) s].back(), g0, err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
             q.push_back(s);
         }
-        int since = 0, boundaries = 0;
         while (!q.empty()) {
             const int s = q.front();
             q.pop_front();
@@ -2290,19 +2385,23 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         const double multi_s = secs(t0, now());
+        st_b = model.fast_stats();
+        tiers("solo", solo_a, solo_b, G);
+        tiers(model.rows_ok() ? "together" : "pipelined", st_a, st_b, n * G);
         const auto agree = [](const std::vector<int>& a, const std::vector<int>& b) {
             size_t k = 0;
             while (k < a.size() && k < b.size() && a[k] == b[k]) ++k;
             return k;
         };
         const size_t same = agree(solo, out[0]);
-        std::printf("  solo vs solo again: %zu of %zu agree\n", agree(solo, solo2), solo.size());
+        std::printf("  solo vs its untimed warm-up run: %zu of %zu agree\n", agree(solo, solo2), solo.size());
         for (int s = 1; s < n; ++s)
             std::printf("  seq %d vs seq 0: %zu agree, vs solo: %zu\n", s, agree(out[(size_t) s], out[0]),
                         agree(out[(size_t) s], solo));
-        std::printf("MULTI BENCH %d seqs, prompt %d, %d tokens each: solo %.1f tok/s | pipelined %.1f tok/s total, "
+        std::printf("MULTI BENCH %d seqs, prompt %d, %d tokens each: solo %.1f tok/s | %s %.1f tok/s total, "
                     "%.1f per sequence (%d boundaries) | sequence 0 same tokens: %zu of %zu\n", n, L, G,
-                    (G - 1) / solo_s, (double) n * (G - 1) / multi_s, (G - 1) / multi_s, boundaries, same, solo.size());
+                    (G - 1) / solo_s, rows ? "together" : "pipelined", (double) n * (G - 1) / multi_s,
+                    (G - 1) / multi_s, boundaries, same, solo.size());
         for (int s = 0; s < n; ++s) {
             std::printf("  seq %d:", s);
             for (int i = 0; i < 12 && i < (int) out[(size_t) s].size(); ++i) std::printf(" %d", out[(size_t) s][(size_t) i]);
@@ -2569,6 +2668,10 @@ static int glm_pack_generate(const Options& o) {
             int req_threads = 0;
             int req_chunks = 0;   // ... and its disk reads' pieces (0: as the engine started)
             int req_rid = -1;
+            req_spec = 0;
+            req_spec_min_p = -1.0;
+            req_spec_n_min = -1;
+            req_spec_cum = -1.0;
             std::string tok2, ids, emb_path;
             while (ss >> tok2) {
                 const size_t eq = tok2.find('=');
@@ -2593,6 +2696,10 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "cpu_threads") { req_threads = std::atoi(v.c_str()); }
                 else if (k == "read_chunks") { req_chunks = std::atoi(v.c_str()); }
                 else if (k == "rid") { req_rid = std::atoi(v.c_str()); }
+                else if (k == "spec") { req_spec = std::atoi(v.c_str()); }
+                else if (k == "spec_min_p") { req_spec_min_p = std::atof(v.c_str()); }
+                else if (k == "spec_n_min") { req_spec_n_min = std::atoi(v.c_str()); }
+                else if (k == "spec_cum") { req_spec_cum = std::atof(v.c_str()); }
                 // penalty_* need machinery this mode does not have (history rows): ignored rather than approximated
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
@@ -2718,6 +2825,11 @@ int main(int argc, char** argv) {
             setenv("STRATA_GLM_RAM_RESIDENT", "1", 1);
 #endif
         }
+        else if (a == "--parallel") {   // the sequence states (STRATA_GLM_SEQS): n conversations at once
+            const int n = std::atoi(next("--parallel"));
+            if (n < 1 || n > 8) { std::fprintf(stderr, "--parallel takes 1..8\n"); return 2; }
+            set_env("STRATA_GLM_SEQS", std::to_string(n).c_str());
+        }
         else if (a == "--glm-ram-slack") {
             const char* v = next("--glm-ram-slack");
 #if defined(_WIN32)
@@ -2828,10 +2940,14 @@ int main(int argc, char** argv) {
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
-        else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
+        else if (a == "--spec-min-p") {
+            o.spec_min_p = std::atof(next("--spec-min-p"));
+            o.spec_min_p_set = true;
+        }
         else if (a == "--stop-eos") { o.stop_eos = true; o.eos_given = true; }
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
+        else if (a == "--dflash") o.dflash = next("--dflash");
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;

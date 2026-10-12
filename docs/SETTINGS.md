@@ -27,7 +27,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_GLM_RAM_HEADROOM_GB` | 6 | RAM left free for the system when the RAM tier is sized; it also takes one more GPU's prompt buffers, pinned after the measurement - a split of three or more GPUs sets the others' aside on top, and each later GPU measures again and leaves at least half of it free. The pinned tier can't be swapped out, so a Linux desktop whose kernel starts swapping with more free (several displays, a busy session) wants more: a 128 GB desktop with three GPUs and three displays stayed responsive at 16, and swapped at 12 (#77) |
 | `STRATA_GLM_RAM_GB` | from free RAM | a fixed RAM-tier size in GB |
 | `STRATA_GLM_RAM_RESIDENT` | off | `1` (or `--glm-ram-resident`): the RAM tier holds every expert not in VRAM and nothing is evicted to disk. The start fails if it cannot. For PCs whose RAM holds everything off-card (a 4090 D with 128 GB: decode 1.9x as fast with `PROMOTE_MIN=6`). `STRATA_GLM_RAM_SLACK` is extra slots per MoE layer (default 16) |
-| `STRATA_GLM_SPLIT` | `auto`: a split search on 2-4 GPUs, by free VRAM with more | the first layer of each later GPU (`24`, or `7,12,17,22,27,32,37,41` for nine); `0` = one GPU. The config's `"layer_split"` sets the same. `auto` prices every placement before loading: each card's room for experts after its layers' weights and state, the share of each layer's routes the experts it then holds take (your usage counts; a built-in coverage curve without them), each layer's reads over the card's memory bandwidth and each miss over the host's RAM speed - and takes the fastest one every card can start (on a two-GPU split that drafts with the model's MTP block the two cards work on consecutive tokens, so the token costs the slower card: RTX 3090 + 5060 Ti drafting with a NextN block, 24 -> 26, the cards 25.3 / 32.2 -> 28.1 / 29.8 ms a token, decode +3-5%). `STRATA_GLM_SPLIT_LOG=1` prints every placement's prediction |
+| `STRATA_GLM_SPLIT` | `auto`: a split search on 2-4 GPUs (and on more under DFlash2's pipelined window), by free VRAM with more | the first layer of each later GPU (`24`, or `7,12,17,22,27,32,37,41` for nine); `0` = one GPU. The config's `"layer_split"` sets the same. `auto` prices every placement before loading: each card's room for experts after its layers' weights and state, the share of each layer's routes the experts it then holds take (your usage counts; a built-in coverage curve without them), each layer's reads over the card's memory bandwidth and each miss over the host's RAM speed - and takes the fastest one every card can start (on a two-GPU split that drafts with the model's MTP block the two cards work on consecutive tokens, so the token costs the slower card: RTX 3090 + 5060 Ti drafting with a NextN block, 24 -> 26, the cards 25.3 / 32.2 -> 28.1 / 29.8 ms a token, decode +3-5%). Under DFlash2's pipelined window (three GPUs or more) the slowest card paces every draft: the search runs on any number of GPUs (from five, a DP over the layers for each cap on the slowest card), each layer also costs a fixed 0.4 ms (`STRATA_GLM_SPLIT_LAYER_MS`) and a miss is priced at the shared CPU pool's speed, half the host's (Maya-L over an RTX 3090 and eight 5060 Ti: the 3090 takes 8 layers instead of the 10 its VRAM share gave it, 57.1 / 58.9 -> 61.6 / 63.1 tok/s). `STRATA_GLM_SPLIT_LOG=1` prints every placement's prediction |
 | `STRATA_GLM_PARALLEL_LOAD` | on | a split's GPUs load at once, a thread each: they plan their RAM tiers one after another in GPU order (each gets the tier a load one by one gives it), then pin and warm them at the same time (4 x Tesla T4, Maya-L from a cold page cache: start to the first token 142 -> 96 s). `0` = one GPU after another |
 | `STRATA_GLM_CPU_LANE` | one thread per physical core (one GPU, or one pool shared by a split of 3+ GPUs: at most one NUMA node's; two GPUs: half each; cores without SMT: two thirds of them) | CPU threads for RAM-tier experts; `0` = off (the tuning sets it) |
 | `STRATA_GLM_CPU_LANE<n>` | the setting above | the same for CUDA`<n>` alone (`STRATA_GLM_CPU_LANE0=6`, `STRATA_GLM_CPU_LANE1=2`): two cards on links of different speed want different counts - the slower the link, the more CPU threads help. RTX 4070 Ti SUPER on PCIe 3.0 x4 + RTX 5070 Ti on 4.0 x16, split 17: 6 / 2 threads beat the default 4 / 4 |
@@ -48,11 +48,11 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_GLM_SLOTS` | 4 | conversations kept aside on the SSD, so switching back to one doesn't re-read its prompt; `0` = off |
 | `STRATA_GLM_SLOT_MIN`, `STRATA_GLM_SLOT_GB`, `STRATA_GLM_SLOT_DIR` | 1024, 16, `<pack>/slots` | the shortest conversation kept aside (tokens, down to 1), their total size on disk (GB), and the folder |
 | `STRATA_GLM_SLOT_KEEP`, `STRATA_GLM_SLOT_DAYS` | off, 7 | `1`: the kept conversations outlive the engine - the folder is not emptied at start (a slot is kept when its `.meta` names this model, engine version and pack, else removed), the conversation in the model is kept when the engine ends, and a slot unused for `STRATA_GLM_SLOT_DAYS` days is removed. With a supervisor that stops the model when it idles (llama-swap), the next request after a restart reads only its new tokens (a 4K-token conversation back in 0.2 s instead of re-read) |
-| `STRATA_GLM_SEQS`, `STRATA_GLM_SEQ_CTX` | 1, the context | two GPUs or more: n conversations decode at once - the engine keeps n sequence states (the first for the whole context, the others for `STRATA_GLM_SEQ_CTX` tokens) and a token of each goes through the split's GPUs one behind the other, so every GPU works on a different conversation instead of waiting for the others. One request alone keeps the speculative decode. 4x RTX 4090, Maya-S24: 110 tok/s alone, 132 in all for two, 225 for four; each extra state takes its size from the expert pool (three at 64K: 3.5 GB). On one GPU it gains nothing (4.0 tok/s alone, 4.3 in all for two): leave it at 1 |
+| `STRATA_GLM_SEQS`, `STRATA_GLM_SEQ_CTX` | 1, the context | the first is `--parallel` (above): n conversations at once, n sequence states - the first for the whole context, the others for `STRATA_GLM_SEQ_CTX` tokens. On a split a token of each goes through the GPUs one behind the other, so every GPU works on a different conversation (4x RTX 4090, Maya-S24: 110 tok/s alone, 132 in all for two, 225 for four); each extra state takes its size from the expert pool (three at 64K: 3.5 GB) |
 | `STRATA_GLM_MULTI_ROOM`, `STRATA_GLM_MULTI_BOUNDARY`, `STRATA_GLM_MULTI_SPEC` | 16384, 32, on | with `STRATA_GLM_SEQS`: the room a conversation state must leave after a prompt (a longer prompt waits for the first, large state; max tokens are cut to the state), how many tokens a conversation decodes between two updates of the expert tiers, and whether a request alone uses the speculative decode |
 | `STRATA_GLM_PROMOTE` | 8 | when the CPU computes every RAM-tier expert (it beats the PCIe link), experts moved between VRAM and RAM in the background per token, so VRAM follows what you use; `0` = off |
 | `STRATA_GLM_PROMOTE_MIN` | 0 | a fetched expert is kept in VRAM only when its aged route count is at least this. `0` or `1` is the old rule (keep it whenever a spare is free). A flat route table promotes one-off experts and then evicts them; `6` stopped that churn on one 4090 D with 128 GB of RAM; with little RAM it costs (2x V100, 30 GB: 29.6 -> 28.3 tokens/s) |
-| `STRATA_GLM_PROMOTE_FILL` | 24 | while VRAM has free expert slots (after a prompt gives back what it borrowed), up to this many of the hottest RAM-tier experts are copied into them per token (several per layer) instead of `STRATA_GLM_PROMOTE`; `0` = the same pace as the moves |
+| `STRATA_GLM_PROMOTE_FILL` | 24 | while VRAM has free expert slots (after a prompt gives back what it borrowed), up to this many of the hottest RAM-tier experts are copied into them per token (several per layer) instead of `STRATA_GLM_PROMOTE`; `0` = the same pace as the moves. The refill runs whatever the CPU lane's plan (the moves between VRAM and RAM only with the all-CPU plan): on nine GPUs whose 5060 Tis send one of 7-8 RAM-tier experts over PCIe, ~13% of VRAM used to stay empty after a long prompt |
 | `STRATA_GLM_VRAM_EVICT` | unset | `lru`: a layer's spare is refilled by evicting its least recently used expert instead of its least-used by the aged counts. It matters as much as experts are promoted (fetched over PCIe rather than computed by the CPU lane): Maya-L on an RTX 3090 + 3060 with a RAM tier and an NVMe tier, decode at 21K +2.6% (VRAM hits 54.5 -> 55.9 %); Maya-M there with `STRATA_GLM_CPU_PLAN=012234567` (one PCIe fetch a route at most) unchanged |
 | `STRATA_GLM_MV_RDNA` | AMD: on for the Ryzen AI Max APUs (gfx115x) | the decode's dense GEMVs (the Q6_K and BF16 projections) in one RDNA3 kernel that keeps two blocks' loads in flight, bit for bit the original kernels' (Radeon 8065S, Maya-S: decode +3.1%); `1` = on any gfx11 (an RX 7900: not measured yet), `0` = off. NVIDIA: no effect |
 | `STRATA_GLM_MTP_GGUF` | the model's own | two GPUs or more: a GGUF holding the MTP draft block to draft with - for a model published without one, or a more precise block than its own (`tools/maya_quant/mtp_gguf.py` writes a model's block alone); `STRATA_GLM_NO_MTP=1` = no drafting |
@@ -69,9 +69,14 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_GLM_KV_INT8` | off | `1` (or `--kv int8` in the config's `"args"`): the attention's latent cache in INT8 - 512 codes and one FP16 scale per 32 values, 544 bytes a token and layer instead of 1024. One V100, 128K context: state 1.78 -> 1.13 GB, 84 more expert slots; no measurable quality change (KL against FP16 within FP16's own run-to-run spread) |
 | `STRATA_GLM_DSA_SCORE` | on | prompts: the sparse attention's indexer scores as a register-tiled FP32 GEMM (a 3090, 4096 tokens at position 10K: 78.8 -> 5.6 ms); `0` = the warp-per-pool kernel |
 | `STRATA_GLM_PREFILL_ATTN` | tensor cores | prompts' sparse attention kernel: on Ampere and newer an mma.sync kernel with 32 heads a block (a 3090, 26.6K-token prompt: 832 -> 966 tok/s); `wmma` = the 91 KB shared-memory kernel Volta runs, `tcreg` = the register kernel Turing runs, `f32` = the FP32 kernel. AMD: `wmma2`, the default on gfx12 (R9700 / RX 9070: prompts +8-10%), or `f16q`, the default on gfx11 and Strix Halo. `STRATA_GLM_PREFILL_ATTN_CHECK=1` compares the chosen kernel with the FP32 one (debug) |
+| `STRATA_GLM_EXL3_MMA_ROWS` | 64 | EXL3 packs' prompts: an expert routed at most this many of a chunk's tokens runs in tensor-core kernels that decode its trellis as they go (RTX 30 and newer); a busier one is decoded to FP16 once and multiplied by cuBLAS. `0` = cuBLAS for every expert |
 | `STRATA_GLM_DROP_CACHE` | on with 2+ NUMA nodes | before the RAM tier is pinned, the model files' clean page cache is dropped (the engine reads experts with O_DIRECT): a cached GGUF filling one node made the interleaved tier land 78% on the other, and the CPU lane read one socket's memory; `0` = keep it |
 | `STRATA_GLM_PROFILE_WEIGHT` | 1 | the weight of the pack's routing profile (`expert_counts.txt`) against your usage file in the start-up order of the expert tiers; `0` = your usage only |
 | `STRATA_GLM_LOOP_THINK`, `STRATA_GLM_LOOP_ANSWER` | 256, 1024 | the loop guard: when the last this-many generated tokens are one pattern of at most 32 tokens repeated exactly (a quantized model can fall into `0 0 0 ...` until `max_tokens`), thinking is closed at once, and in the answer the model's current tool-call argument (or else the turn) is closed so an agent goes on; a second loop in the same answer ends it. `0` = off |
+| `STRATA_GLM_WIN_PIPE` | three GPUs or more | DFlash2 on a split: `1` = the pipelined verify window (the GPUs on consecutive tokens at once), `0` = the batched one (the whole window a GPU at a time). Two GPUs take the batched one, three or more the pipelined one |
+| `STRATA_GLM_WIN_THREADS`, `STRATA_GLM_WIN_SKIP` | on | the pipelined window (A/B): `0` = one host thread issuing every GPU's work (nine GPUs: 3-5 ms a token, longer than any GPU's share) / the tokens after a wrong draft run their work anyway |
+| `STRATA_GLM_WIN_LANES`, `STRATA_GLM_WIN_CPU`, `STRATA_GLM_WIN_STAGGER`, `STRATA_GLM_WIN_ALLCPU` | 2, on, on, on | the batched window (one GPU, or two): its CPU lane on two pools - one GPU: a second pool on the other NUMA node (`2`: both unpinned, `1`: pinned to a node each, `0`: one pool); two GPUs: each GPU's window layer also on the other GPU's pool - with each layer's distinct experts read once and split between the two (`STRATA_GLM_WIN_CPU=0`: a token a pool); the window's tokens in two groups whose layer halves interleave, so the CPU answers one group while the GPU runs the other's attention (`STRATA_GLM_WIN_STAGGER=0`: all of them a layer at a time); and every RAM-tier expert of a window to the CPU (`STRATA_GLM_WIN_ALLCPU=0`: the calibrated CPU / PCIe plan). One single token keeps one pool |
+| `STRATA_GLM_DFLASH_STATS`, `STRATA_GLM_DFLASH_PROF` | off | DFlash2: a line a round to that file (drafts checked and kept, the draft's and the window's ms, the round's CPU-lane experts and VRAM misses, the drafts' confidences) / `1` = each request's round timing in the engine log |
 | `STRATA_GLM_TIMING`, `STRATA_GLM_POOL_STATS` | off | `1` = timing and cache statistics in the engine log |
 | `STRATA_GLM_ROUTE_LOG` | off | `<prefix>`: every decode route as a line in `<prefix>.<GPU>` - the layer, its experts, which were fetched, missed or computed on the CPU, then after a `\|` the 16 near misses (the next ranks by the same score) - for cache studies: `tools/glm_tier_replay.py` replays a log through a model of the VRAM tier's rules and alternatives |
 | `STRATA_GLM_SCORE_PREFILL` | off | with `STRATA_GLM_SCORE=<c>` (score `--tokens` after the first c): `1` reads those c tokens through the prompt path instead of one by one, so a long context is scored in minutes (debug: comparing KV-cache formats at long context) |
@@ -101,3 +106,81 @@ what you changed there):
 
 One card streams nearly every expert over PCIe for each chunk, so fewer, larger chunks pay off on long prompts. On a
 split, a prompt that fits one chunk runs the cards one after the other, while two or more keep both busy.
+
+## Several requests at once
+
+`--parallel N` (1-8, default 1). `./maya.sh --parallel 4` (Windows:
+`START-MAYA.bat --parallel 4`) keeps it in the config's `"args"`. Maya then answers up to N requests at the same time,
+and the ones after them wait their turn. The dashboard shows how many answers are being written, and `/v1/status`
+reports N as its concurrency.
+- **One GPU:** a token of each request goes through the model together. Every dense weight (the attention
+  projections, the shared experts, the dense FFN layers and the output head) is read once for all of them, while the
+  attention and the routed experts run per request. Each request gets exactly the tokens it would get alone (greedy,
+  CPU lane off: checked with 2 and 4 at once). Real chat questions on a V100 32 GB that streams most of Maya-S's
+  experts from RAM: 21.2 tok/s in all for two at once against 15.0 one after another (x1.41), x1.35 for four. Each
+  conversation brings its own experts, so on a card that holds only part of them they share its VRAM; the more of the
+  model VRAM holds, the less they compete. With every expert in GPU memory (a Strix Halo with Maya-S): x1.67 for two at
+  once and x2.02 for four.
+- **Two GPUs or more:** each card works on a different request, one behind the other.
+- **A request alone** decodes as fast as before (on a split, with the speculative decode).
+
+Each extra request keeps its own context state in VRAM (the attention caches, the recurrent states and a snapshot),
+taken from the expert pool at the start, so a larger N leaves fewer experts in VRAM; the log's `glm multi:` line gives
+the size. With N above 1 the engine decodes without a [DFlash2 drafter](#drafting-with-dflash2) (the log says so).
+
+## Drafting with DFlash2
+
+`./maya.sh --setup --draft dflash2` downloads the drafter (0.7 GB,
+[on Hugging Face](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF); its license is CC BY-NC-ND 4.0:
+non-commercial use only) and passes it as `--dflash GGUF` in the config's `"args"`; NVIDIA GPUs, one request at a time
+(`--parallel 1`). The setup offers it on RTX 30 / A100 and newer (sm_80): on Tesla V100s it decoded slower than the MTP
+block, on one GPU and on two.
+
+A DFlash2 drafter made for GLM-5.3-Flash - a small block drafter that reads
+the model's hidden states at five of its layers and drafts up to 7 tokens in one pass, with the model's own embedding
+and head - takes the place of the MTP block: with it the engine does not load the MTP block. Each round it drafts a
+block, one verify window checks the drafts, and the longest right prefix is kept with the model's own next token - the
+same tokens as decoding one at a time.
+
+On three GPUs or more the window is a pipeline: the GPUs work on consecutive tokens of the window at once (one host
+thread a GPU issues the work), the drafter drafts while the window's first token is already running, each token's pick
+is read as it leaves the last GPU, and the tokens after a wrong draft skip their work (their experts are not fetched or
+computed on the CPU either) while the next round starts behind them. The slowest GPU paces every draft, so the split
+search balances the GPUs' time there, not only their VRAM (`STRATA_GLM_SPLIT`, above).
+
+On one GPU, and on two, the window is a batched pass instead, built for a decode whose CPU lane sets the pace: its
+tokens in two groups whose layers interleave (the CPU answers one group's experts while the GPU runs the other's
+attention), each layer's experts read once for the tokens that share them and split between two CPU pools - a second
+one on the other socket with one GPU, the other GPU's pool with two - and the window's RAM-tier experts all on the
+CPU. Two GPUs check at least one draft a round and up to four while the product of their confidences stays at 0.9
+(there a window of two costs only ~1.25 lone tokens); one GPU checks the drafts above confidence 0.95, and none below
+it (~1.55 lone tokens).
+
+| Argument | What it does |
+| --- | --- |
+| `--dflash GGUF` | the drafter (`STRATA_GLM_DFLASH` the same); it sits on the GPU with the model's head |
+| `--spec T` | a round's window at most T tokens: the token and up to T - 1 drafts (default: the drafter's block, 8; four drafts on two GPUs) |
+| `--spec-min-p P` | the drafts stop at the first whose selector confidence is below P (default 0.5 on three GPUs or more, where a wrong draft costs little; 0.95 on one GPU; on two GPUs the product of the confidences instead, below) |
+
+A request can set its own window and cut (for tuning, without a restart): `"strata_tune": {"spec": 6,
+"spec_min_p": 0.5}` (and `"spec_n_min"`: drafts kept whatever their confidence, `"spec_cum"`: a cut on the product of
+the confidences - two GPUs default to 1 and 0.9; `STRATA_GLM_DFLASH_MIN` / `_CUM` set them for every request);
+`"spec": 1` decodes without drafting.
+
+Maya-L, greedy answers to five prompts - explanation, code, a list, a short story, a question about a
+20,000-character document - in tokens/s, each pair measured back to back. Nine GPUs (an RTX 3090 and eight RTX 5060
+Ti, the CPU lane on):
+
+| | explanation | code | list | story | document | all |
+| --- | --- | --- | --- | --- | --- | --- |
+| the MTP block (two runs) | 43.7 | 44.7 | 46.1 | 38.3 | 42.0 | 42.6 |
+| DFlash2 (three runs) | 60.1 | 76.2 | 90.8 | 48.0 | 51.8 | **61.4 (+44%)** |
+
+One RTX 3090 (the MTP block is not loaded on one GPU: plain decode), and the 3090 with one 5060 Ti:
+
+| | explanation | code | list | story | document | all |
+| --- | --- | --- | --- | --- | --- | --- |
+| 3090, plain decode (two runs) | 16.4 | 15.7 | 15.6 | 16.4 | 14.0 | 15.8 |
+| 3090, DFlash2 (two runs) | 19.4 | 20.6 | 20.2 | 17.1 | 16.4 | **18.8 (+19%)** |
+| 3090 + 5060 Ti, the MTP block (three runs) | 20.9 | 21.3 | 21.9 | 16.7 | 19.4 | 19.7 |
+| 3090 + 5060 Ti, DFlash2 (three runs) | 23.2 | 24.2 | 25.8 | 19.4 | 19.2 | **22.1 (+12%)** |

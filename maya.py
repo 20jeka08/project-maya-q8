@@ -22,12 +22,13 @@ What the first run does (each step is skipped when it is already done):
      on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD gfx1100/gfx1201/gfx1151 and ROCm 7 instead
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (Maya-S,
-     Maya-S24, Maya-M, Maya-M-Derisked or Maya-L)
+     Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 bits, experimental and
+     NVIDIA only)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
   4. compiles the engine (`build/strata`, or `build-hip/strata`) for your GPU(s): 10-30 minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
      and the size - and starts only after you answer y (or pass --download-model)
-  6. builds the pack (the engine's index of the GGUF files) inside the model folder
+  6. builds the pack (the engine's index of the model files) inside the model folder
   7. images: compiles the vision encoder (`build-vision/bin/strata-vision`) and fetches the model's vision files
      (1.1 GB, shown and asked first like the model; --no-vision and HIP skip it)
   8. writes maya-<model>.json and run-maya-<model>.sh (.bat on Windows) - with the settings tuned for this PC
@@ -206,7 +207,98 @@ MODELS = {
                            "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
                        "GLM-5.3-Flash-vocab.gguf":
                            "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    # turboderp's EXL3 (exllamav3) quant, read in place from its safetensors: the pack (tools/exl3_pack.py) puts a
+    # small GGUF of the unquantized tensors beside them.  "files": every file of the branch with its size (what is
+    # downloaded, and how a download is known whole); "revision": the branch's commit the hashes belong to.
+    "EXL3-3.05bpw": {
+        "about": "turboderp's EXL3 quant at 3.05 bits per weight (exllamav3's trellis format, which the engine reads "
+                 "in place from its safetensors), with the MTP draft block - experimental, NVIDIA GPUs only",
+        "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "3.05bpw",
+        "revision": "332ab457b709b7ba30dd9a448be5de03b80a7ac9", "folder": "", "download_gb": 125.3,
+        "files": {
+            "config.json": 86509, "LICENSE": 1070, "README.md": 7238, "chat_template.jinja": 8617,
+            "generation_config.json": 194, "kpool_aux.safetensors": 11548768,
+            "model-00001-of-00015.safetensors": 8589636152, "model-00002-of-00015.safetensors": 8588356452,
+            "model-00003-of-00015.safetensors": 8590179904, "model-00004-of-00015.safetensors": 8588365508,
+            "model-00005-of-00015.safetensors": 8588365508, "model-00006-of-00015.safetensors": 8588365500,
+            "model-00007-of-00015.safetensors": 8590186912, "model-00008-of-00015.safetensors": 8588365508,
+            "model-00009-of-00015.safetensors": 8588365508, "model-00010-of-00015.safetensors": 8588365500,
+            "model-00011-of-00015.safetensors": 8590186912, "model-00012-of-00015.safetensors": 8588365508,
+            "model-00013-of-00015.safetensors": 8588365508, "model-00014-of-00015.safetensors": 8590694168,
+            "model-00015-of-00015.safetensors": 2059162376, "model.safetensors.index.json": 15960981,
+            "mtp.safetensors": 2862645889, "processor_config.json": 909, "quantization_config.json": 47905678,
+            "tokenizer.json": 20217442, "tokenizer_config.json": 761},
+        "sha256": {
+            "config.json":
+                "0bef79e79b28fa9c51d57c49bd53adc59005c916832879ad3f0862e284a7bc06",
+            "LICENSE":
+                "30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1",
+            "README.md":
+                "4f46db37e6a7cbe3a494d6d7f616a96f4fffe6d1de68be361199a715c8d928fc",
+            "chat_template.jinja":
+                "41cff9af7b3a86c96751b107a8444f245fbda0bd5320b636a5bb1f7f4ba1a5c3",
+            "generation_config.json":
+                "230c30609ecbbb9e6583bedde8e7bdda0c6eb8fe5fad0eaeb3d1b293d751cb4f",
+            "kpool_aux.safetensors":
+                "39053cd051c75e81b7e608818111a4b4c3c57da540599089419fe11b51ca02d3",
+            "model-00001-of-00015.safetensors":
+                "6b6b96190a5114a55d058e3f4ae8a4350ac334dfcf804f61c39d5c6e40340ba4",
+            "model-00002-of-00015.safetensors":
+                "29fda4953918a156758169afa120929fdd35407860eddf5cad0cb747f65475ed",
+            "model-00003-of-00015.safetensors":
+                "9844130df84df3138706a0a708775c8d010a7ed370539880e327cac6bec7f2b7",
+            "model-00004-of-00015.safetensors":
+                "4f2a6fb68fb6cceab231d9c4a54b96174b4ec2b1bbf5cf042a6e4be37c739e29",
+            "model-00005-of-00015.safetensors":
+                "73cd6d0b5ba7f6d0ce23982729c6342d38114dd89d8a884a2fa08133ef52b47a",
+            "model-00006-of-00015.safetensors":
+                "160fcfc258b61c7aa7cbc27c4d6a33daee8bfe6dbb0e7dd5e73ce901789f391e",
+            "model-00007-of-00015.safetensors":
+                "a94f480c4256b7e5311b5384574471caff4f4fc0def8c3e1c57c411222cb1ce4",
+            "model-00008-of-00015.safetensors":
+                "e513ba853f8b8cb7dac8f17ff9f281787a63cc67daea15fc288591f93eec62f5",
+            "model-00009-of-00015.safetensors":
+                "825928573f534c09dc8e157356359bc525e883933777fa0d09d7a30a3f13d8b0",
+            "model-00010-of-00015.safetensors":
+                "f82170395c010c1b40b3695bcca439ac54445b268936ee71eb48c28f347d0d0d",
+            "model-00011-of-00015.safetensors":
+                "240ece46708e5c41aaf365bb2659ed7da2134bc12d9fa9b5393555c103228c6f",
+            "model-00012-of-00015.safetensors":
+                "2738042b40d05e144e54ed3c1013831d7dc156b694a1d68a49d55b25369ac8d9",
+            "model-00013-of-00015.safetensors":
+                "cf097956efdf8c307a6e560786445f1715c7bba9b2bddfb300f7346b1e1eb3ba",
+            "model-00014-of-00015.safetensors":
+                "1add7e6d8f4866e5aeecf77ac9ca2aacce3f071455fa9c167fa9bc678551c923",
+            "model-00015-of-00015.safetensors":
+                "d14a0087710b04a680f2d2a8769fa26f4e53dd3c1d5ce5391798ba25da1947f4",
+            "model.safetensors.index.json":
+                "559538d5006f757c809ef0a545062c2f79abb0140667399d590af0da96f26735",
+            "mtp.safetensors":
+                "7274f06d75842edfa258830c836fd790a19324513134e05cd1e931929c4c384d",
+            "processor_config.json":
+                "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed",
+            "quantization_config.json":
+                "308d9a4b28407e2ada887f512bc8793c608586a73d9e0108ca258220ac714280",
+            "tokenizer.json":
+                "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+            "tokenizer_config.json":
+                "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc"},
+        # the pictures: the vision tower and its tokenizer are the same in every GLM-5.3-Flash quant
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "vision",
+            "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf", "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
 }
+# The DFlash2 drafter the setup offers instead of drafting with the model's MTP block (--dflash): a small block drafter
+# made for GLM-5.3-Flash (any of the quants above), pinned to the revision it was measured with and verified.
+DFLASH = {"repo": "Anbeeld/GLM-5.3-Flash-DFlash2-GGUF", "revision": "f3569acb7f9cee95e66d24442d75536eb00ab842",
+          "file": "GLM-5.3-Flash-DFlash2-Q4_K_M.gguf", "bytes": 697017248,
+          "sha256": "f4158ffb805b26c4fe439669c2009908a80ea89e1576ecea4d03eaded18f017c",
+          "license": "CC BY-NC-ND 4.0"}   # (the repo's: non-commercial use only, shown wherever it is offered)
+DRAFTS = ("mtp", "dflash2")                        # the setup's drafting choices; MTP the default
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 PACK_FILES = ("index.txt", "native_experts.txt", "dense.bin", "tokenizer/vocab.json", "tokenizer/merges.txt",
@@ -782,7 +874,14 @@ def choose_context(a, prev_ctx) -> int:
 
 
 def shard_names(m: dict, pattern: str | None = None) -> list:
+    """A download's files under their names on Hugging Face: a GGUF's shards, or an EXL3 model's every file."""
+    if "files" in m and pattern is None:
+        return list(m["files"])
     return [(pattern or m["file"]).format(i=i, n=m["shards"]) for i in range(1, m["shards"] + 1)]
+
+
+def is_exl3(quant: str) -> bool:
+    return MODELS.get(quant, {}).get("format") == "exl3"
 
 
 def old_names(m: dict) -> list:
@@ -820,6 +919,30 @@ def download_dir(models: Path, quant: str) -> Path:
     return d
 
 
+def choose_draft(a, pc: dict, inst: dict) -> str:
+    """"mtp" (the model's own MTP block; the default) or "dflash2" (a DFlash2 drafter, downloaded in step 5): --draft,
+    else asked - the earlier setup's answer is the default.  AMD (HIP) setups keep MTP: DFlash2 is measured on NVIDIA.
+    So do NVIDIA GPUs before sm_80 (RTX 30 / A100): on Tesla V100s DFlash2 decoded slower than the MTP block (one GPU
+    and two)."""
+    if getattr(a, "draft", None):
+        return a.draft
+    if pc.get("backend") == "hip":
+        return "mtp"
+    if pc.get("archs") and min(int(x) for x in pc["archs"]) < 80:
+        return "mtp"
+    default = inst.get("draft") if inst.get("draft") in DRAFTS else "mtp"
+    rows = [("the model's MTP block", "default",
+             "The model's own draft block guesses the next token, which the model then checks. On two GPUs or "
+             "more; one GPU decodes without drafting."),
+            (f"a DFlash2 drafter (download {DFLASH['bytes'] / 1e9:.1f} GB from Hugging Face)", None,
+             "A small drafter made for GLM-5.3-Flash drafts up to 7 tokens a round, which the model then checks: the "
+             "same answers, faster. Maya-L: +44% on nine GPUs and +12% on two against the MTP block, +19% on one "
+             f"RTX 3090. The drafter's license is {DFLASH['license']}: non-commercial use only.")]
+    pick = choose("Drafting?", ["How the model drafts tokens ahead (the answers are the same either way):"], rows,
+                  DRAFTS.index(default), a.yes)
+    return DRAFTS[pick]
+
+
 def choose_model(a, models: Path, inst: dict) -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
     the downloads - the earlier download is the default."""
@@ -828,9 +951,13 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         if first is None:
             fail(why, "--gguf-dir takes the folder that holds the GLM-5.3-Flash .gguf files, or the (first) .gguf file")
         return "local", first
+    hip = getattr(a, "backend", None) == "hip"
     if a.model:
+        if hip and is_exl3(a.model):
+            fail(f"{a.model} runs on NVIDIA GPUs only (the HIP port has no EXL3 kernels)",
+                 f"pick another model: {ME} --setup")
         return "download", a.model
-    opts = list(MODELS)
+    opts = [q for q in MODELS if not (hip and is_exl3(q))]   # (EXL3: NVIDIA only)
     # cards of 24 GB or less: Maya-S24 (its 4-bit attention leaves ~1.5 GB more of the card for experts - decode about
     # 14% faster there), else Maya-S
     try:
@@ -846,7 +973,7 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         rows.append((f"{q}: " + (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging "
                                                                      "Face"),
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
-                     else None, m["about"]))
+                     else "experimental" if is_exl3(q) else None, m["about"]))
     pick = choose("Model?", ["The model to download (GLM-5.3-Flash GGUF files you already have: --gguf-dir <file or "
                              "folder>):"], rows, opts.index(default), a.yes)
     return "download", opts[pick]
@@ -1256,8 +1383,21 @@ def incomplete(path: Path):
     return None if have >= need else f"short: {have:,} of {need:,} bytes"
 
 
+def file_incomplete(m: dict, path: Path):
+    """Why a download's file is not whole, or None when it is: a GGUF by its own tensor directory (incomplete), an
+    EXL3 model's file by its published size."""
+    if "files" not in m:
+        return incomplete(path)
+    if not path.exists():
+        return "missing"
+    have, want = path.stat().st_size, m["files"][hf_name(m, path)]
+    return None if have == want else f"{have:,} of {want:,} bytes"
+
+
 def quant_of(first: Path) -> str:
     for q, mm in MODELS.items():                       # a Maya download, under its name on Hugging Face or its old one
+        if "files" in mm:                              # (an EXL3 download is no .gguf file)
+            continue
         if first.name in [names[0] for names in [shard_names(mm)] + old_names(mm)]:
             return q
     m = re.match(r"GLM-5\.3-Flash-(.+?)(-\d{5}-of-\d{5})?\.gguf$", first.name, re.I)
@@ -1279,7 +1419,7 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
     """Shows what would be downloaded - the source, the size, the exact commands - and downloads only after a yes
     (or --download-model).  False: nothing was downloaded."""
     m = MODELS[quant]
-    missing = [s for s in shards if incomplete(s)]
+    missing = [s for s in shards if file_incomplete(m, s)]
     urls = {s: hf_url(m["repo"], m["revision"], m["folder"], hf_name(m, s)) for s in shards}
     on_disk = sum(s.stat().st_size for s in shards if s.exists()) / 1e9
     remaining = max(0.0, m["download_gb"] - on_disk)
@@ -1289,7 +1429,7 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
         [["curl", "-L", "--fail", "--retry", "5", "-C", "-", "-o", str(s), urls[s]] for s in missing]
     say(f"  {quant}: {m['about']}.")
     say(f"  Source: https://huggingface.co/{m['repo']}" + (f" (folder {m['folder']}/)" if m["folder"] else "") +
-        "; the files' own license applies.")
+        (f" (branch {m['branch']})" if m.get("branch") else "") + "; the files' own license applies.")
     say(f"  The model is {m['download_gb']:.1f} GB in {len(shards)} file{'s' if len(shards) != 1 else ''}; "
         f"{len(missing)} still to download, about "
         f"{remaining:.0f} GB, into")
@@ -1304,8 +1444,12 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
     say("  The exact commands (resumable: running them again continues an interrupted download):")
     for c in cmds:
         say("    " + shell_join(c))
-    say("  You can also run them yourself (or download the files any other way into that folder, or pass")
-    say(f"  --gguf-dir <folder with the files>), then run {ME} again.")
+    if "files" in m:                                   # (--gguf-dir takes GGUF files only)
+        say(f"  You can also run them yourself (or download the files any other way into that folder), then run {ME}")
+        say("  again.")
+    else:
+        say("  You can also run them yourself (or download the files any other way into that folder, or pass")
+        say(f"  --gguf-dir <folder with the files>), then run {ME} again.")
     if not curl:
         warn("curl is not installed" + ("" if WIN else " (sudo apt-get install -y curl)") + ": if you say yes, the "
              "same URLs are downloaded with Python instead (also resumable)")
@@ -1324,7 +1468,7 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
                      f"run {ME} --download-model again: it continues where it stopped")
         else:
             S.download(urls[s], s)
-        why = incomplete(s)
+        why = file_incomplete(m, s)
         if why:
             fail(f"{s.name} after the download: {why}", f"delete it and run {ME} --download-model again")
         want = m["sha256"].get(hf_name(m, s))
@@ -1338,7 +1482,7 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
 
 def model_step(a, models: Path, choice: tuple):
     """(model folder, shards, quant name), or None when the files are not there and were not downloaded."""
-    step(5, "the model (GLM-5.3-Flash, GGUF)")
+    step(5, "the model (GLM-5.3-Flash)")
     kind, what = choice
     if kind == "local":
         shards, quant, d = shard_set(what), quant_of(what), what.parent
@@ -1353,18 +1497,42 @@ def model_step(a, models: Path, choice: tuple):
         m = MODELS[quant]
         d = download_dir(models, quant)
         shards = local_shards(m, d)
-        if any(incomplete(s) for s in shards) and not offer_download(a, quant, d, shards):
+        if any(file_incomplete(m, s) for s in shards) and not offer_download(a, quant, d, shards):
             return None
-    from gguf_reader import GGUFFile
-    arch = str(GGUFFile(shards[0]).metadata.get("general.architecture", ""))
-    if arch not in GLM_ARCHS:
-        fail(f"{shards[0].name} is a {arch!r} model, not GLM-5.3-Flash (glm5-next)")
+    if is_exl3(quant) and kind != "local":
+        conf = read_json(d / "config.json")
+        method = (conf.get("quantization_config") or {}).get("quant_method")
+        if conf.get("model_type") != "glm5_next" or method != "exl3":
+            fail(f"{d / 'config.json'}: a {conf.get('model_type')!r} model quantized as {method!r}, not GLM-5.3-Flash "
+                 "in EXL3 (glm5_next, exl3)")
+    else:
+        from gguf_reader import GGUFFile
+        arch = str(GGUFFile(shards[0]).metadata.get("general.architecture", ""))
+        if arch not in GLM_ARCHS:
+            fail(f"{shards[0].name} is a {arch!r} model, not GLM-5.3-Flash (glm5-next)")
     gb = sum(s.stat().st_size for s in shards) / 1e9
     ok(f"{quant}: {len(shards)} file(s), {gb:.1f} GB in {d}")
     if rotational(d):
         warn(f"{d} is on a spinning hard disk: expect slow answers (the engine reads experts from it) - an NVMe SSD "
              "is strongly recommended")
     return d, shards, quant
+
+
+def drafter_step(models: Path) -> Path:
+    """The DFlash2 drafter's file in the models folder (GLM-5.3-Flash-DFlash2/): downloaded and its sha256 checked
+    unless it is there already."""
+    dst = models / "GLM-5.3-Flash-DFlash2" / DFLASH["file"]
+    size = dst.stat().st_size if dst.exists() else 0
+    if size == DFLASH["bytes"] and sha256_ok(dst, DFLASH["sha256"]):
+        ok(f"the DFlash2 drafter: {dst}")
+        return dst
+    if size >= DFLASH["bytes"]:                    # complete but not this file: a fresh download, not a resumed one
+        dst.unlink()
+    say(f"  the DFlash2 drafter: {DFLASH['bytes'] / 1e9:.1f} GB from Hugging Face ({DFLASH['repo']}; license "
+        f"{DFLASH['license']}: non-commercial use only)")
+    fetch(hf_url(DFLASH["repo"], DFLASH["revision"], "", DFLASH["file"]), dst, DFLASH["sha256"])
+    ok(f"the DFlash2 drafter: {dst}")
+    return dst
 
 
 # ------------------------------------------------------------------------------------------------ 6. the pack
@@ -1378,8 +1546,10 @@ def pack_source(pack: Path):
     return m.group(1) if m else None
 
 
-def pack_step(a, d: Path, shards: list, llama: Path) -> Path:
+def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -> Path:
     step(6, "the pack (the engine's index of the model files)")
+    if quant is not None and is_exl3(quant):
+        return exl3_pack_step(a, d)
     # the engine finds the GGUF files at <pack>/.. (src/core/glm_model.cu, load_pack): the pack lives in their folder,
     # in pack/ - or pack-<model>/ when pack/ indexes another model of the same folder
     pack = d / "pack"
@@ -1402,6 +1572,31 @@ def pack_step(a, d: Path, shards: list, llama: Path) -> Path:
     run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
          "--compat-bf16"], env=env)
     missing = [f for f in PACK_FILES if not (pack / f).exists()]
+    if missing:
+        fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
+    ok(f"pack: {pack}")
+    return pack
+
+
+EXL3_GGUF = "maya-exl3.gguf"                       # what tools/exl3_pack.py writes beside an EXL3 model's files
+
+
+def exl3_pack_step(a, d: Path) -> Path:
+    """An EXL3 model's pack (tools/exl3_pack.py): the engine reads the EXL3 weights in place from the safetensors; the
+    pack names them, and a small GGUF beside them holds the unquantized tensors and the tokenizer."""
+    pack = d / "pack"
+    if not a.repack and pack_source(pack) == EXL3_GGUF and (d / EXL3_GGUF).exists() and \
+            all((pack / f).exists() for f in PACK_FILES + ("exl3.txt",)):
+        ok(f"pack already built: {pack}")
+        return pack
+    if not os.access(d, os.W_OK):
+        fail(f"{d} is not writable: the pack and {EXL3_GGUF} are written next to the model's files")
+    say(f"  Writing {EXL3_GGUF} (the unquantized tensors and the tokenizer, about 2 GB), the index of every tensor,")
+    say("  the small float weights (about 1 GB) and the tokenizer; the EXL3 weights stay in the safetensors (a few")
+    say("  minutes) ...")
+    run([sys.executable, str(ROOT / "tools" / "exl3_pack.py"), "--model", str(d), "--out", str(pack)])
+    missing = [f for f in PACK_FILES + ("exl3.txt",) if not (pack / f).exists()] + \
+        ([] if (d / EXL3_GGUF).exists() else [f"../{EXL3_GGUF}"])
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
     ok(f"pack: {pack}")
@@ -1529,7 +1724,7 @@ def write_run_script(cfg_path: Path, port: int) -> Path:
 
 
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
-                 choice: tuple | None = None) -> Path:
+                 choice: tuple | None = None, dflash: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
     port = a.port or 8080
     # --prefill auto (as Strata's setup writes it): the engine picks its prompt chunk - the largest its expert pool
@@ -1539,6 +1734,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
            "tokenizer": str(pack / "tokenizer"), "model_name": MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(SAMPLING), "reasoning_effort": EFFORT, "lib_dirs": meta.get("lib_dirs") or [],
            "port": port}
+    if dflash is not None:                         # DFlash2 drafts instead of the MTP block (the engine loads no MTP)
+        cfg["args"] += ["--dflash", str(dflash)]
     env = parse_env(a.env)
     if pc.get("backend") == "hip":
         cfg["backend"] = "hip"
@@ -1582,14 +1779,17 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
     if cfg_path.exists():
-        kept = keep_args(read_json(cfg_path).get("args") or [], cfg["args"], ("--prefill",))
+        kept = keep_args(read_json(cfg_path).get("args") or [], cfg["args"], ("--prefill", "--parallel"))
         if kept:
             ok("kept from the config before: " + ", ".join(kept))
+    if getattr(a, "parallel", None):
+        set_arg(cfg["args"], "--parallel", a.parallel)
     for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):
         ok(line)
     gguf_dir = local.parent if local else Path(a.gguf_dir).expanduser().resolve() if a.gguf_dir else None
     cfg["installer"] = {"models_dir": str(models), "quant": quant, "gguf": str(local) if local else None,
-                        "gguf_dir": str(gguf_dir) if gguf_dir else None, "written": time.strftime("%Y-%m-%d %H:%M")}
+                        "gguf_dir": str(gguf_dir) if gguf_dir else None, "draft": "dflash2" if dflash else "mtp",
+                        "written": time.strftime("%Y-%m-%d %H:%M")}
     cal = saved_calibration(cfg, any_context=True)     # tuned on this PC for this model (and context) before
     if cal is not None:
         tuned = CAL.apply(cfg.get("env") or {}, cal.get("settings") or {})
@@ -1626,6 +1826,14 @@ def prefill_tips(args: list, ram: float, gpus: int = 2) -> list:
     return []
 
 
+def set_arg(args: list, flag: str, value) -> None:
+    """`flag value` in the engine arguments: its value replaced, or the pair added (`args` is changed in place)."""
+    if flag in args[:-1]:
+        args[args.index(flag) + 1] = str(value)
+    else:
+        args += [flag, str(value)]
+
+
 def keep_args(old: list, new: list, flags: tuple) -> list:
     """The engine arguments `flags` as the old config had them (edited by hand, or written by an earlier setup):
     their values replace the new ones, or are added.  `new` is changed in place; what was kept is returned."""
@@ -1658,7 +1866,7 @@ def hardware_key(cfg: dict) -> str:
     quant = (cfg.get("installer") or {}).get("quant") or cfg.get("model_name", "?")
     return "|".join([" + ".join(g.get("name", "?") for g in sel) or "?",
                      f"{sum(g.get('vram_gb', 0) for g in sel):.0f}GB", S.cpu_info()[0], f"{S.ram_gb():.0f}GB", quant,
-                     str(ctx), "images" if cfg.get("vision") else "text"])
+                     str(ctx), "images" if cfg.get("vision") else "text"] + (["dflash2"] if "--dflash" in a else []))
 
 
 def load_calibrations() -> dict:
@@ -1762,6 +1970,9 @@ def server_command(cfg_path: Path, a) -> tuple:
     """The dashboard's server for an installed config: (its command, its environment, what the setup's screen shows of
     it).  The engine is compiled again first when its source changed (an update)."""
     cfg = read_json(cfg_path)
+    if getattr(a, "parallel", None):                   # --parallel given at a start: kept in the config
+        set_arg(cfg.setdefault("args", []), "--parallel", a.parallel)
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     select_build_backend(cfg.get("backend", "cuda"))
     args = cfg.get("args") or []
     pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
@@ -2207,15 +2418,18 @@ def set_up(a, prev: dict) -> Path | None:
         ok(f"model: {choice[1]}, in {download_dir(models, choice[1])}")
     else:
         ok(f"model: {choice[1]} (yours)")
+    draft = choose_draft(a, pc, inst)
+    ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
     got = model_step(a, models, choice)                # 5
     if got is None:
         return None
     d, shards, quant = got
-    pack = pack_step(a, d, shards, llama)              # 6
+    dflash = drafter_step(models) if draft == "dflash2" else None
+    pack = pack_step(a, d, shards, llama, quant)       # 6
     vision = vision_step(a, pc, meta, llama, d, quant)  # 7
-    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice)   # 8
+    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash)   # 8
     # the tuning: asked for (--calibrate), or offered when nothing was tuned for this PC and model yet and someone
     # answers (--yes and --no-start setups are not held up by it)
     tuned = None
@@ -2263,6 +2477,9 @@ def main() -> int:
                     help="download the model without asking (the commands and the size are still printed)")
     ap.add_argument("--model", choices=list(MODELS), help=f"which download (default: asked, {next(iter(MODELS))} "
                                                           "recommended)")
+    ap.add_argument("--draft", choices=list(DRAFTS),
+                    help="how the model drafts: mtp = its MTP block (the default), dflash2 = a DFlash2 drafter "
+                         f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA)")
     ap.add_argument("--no-vision", action="store_true", help="text only: no image encoder (saves its build and "
                                                              "its 1.1 GB of files)")
     ap.add_argument("--gguf-dir", help="use GLM-5.3-Flash GGUF files you already have: the folder with all of them, "
@@ -2276,6 +2493,10 @@ def main() -> int:
     ap.add_argument("--gpus", help=f"split the model's layers across these GPUs (up to {MAX_GPUS}), e.g. 0,1 or "
                                    "0,1,2,3")
     ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
+    ap.add_argument("--parallel", type=int, choices=range(1, 9), metavar="N",
+                    help="answer up to N requests at once (1-8, default 1), kept in the config: on one GPU they are "
+                         "decoded together, more tokens per second in all; each extra conversation keeps its own "
+                         "context in VRAM, which the expert cache gives up")
     ap.add_argument("--port", type=int, help="the dashboard's and the API's port (default 8080)")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this machine only (default), 0.0.0.0 = also "
                                    "other devices on your network (set --api-key too)")

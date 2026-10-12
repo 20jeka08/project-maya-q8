@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied, MockEngine, Service, StrataEngine, request_timings, serve  # noqa: E402
+from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied, MockEngine, Service, StrataEngine, parse_cors_origins, request_timings, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -363,6 +363,10 @@ class SamplingKeys(unittest.TestCase):
         self.assertIn("spec_min_p=0.7", k)
         bad = self.keys(strata_tune={"pcie_frac": 3, "spec_min_p": True, "pool_workers": 2})
         self.assertFalse([x for x in bad if x.split("=")[0] in ("pcie_frac", "spec_min_p", "pool_workers")])
+        self.assertIn("spec=6", self.keys(temperature=0, strata_tune={"spec": 6}))
+        self.assertIn("spec=1", self.keys(temperature=0, strata_tune={"spec": 1}))
+        for bad in (0, 17, True, 4.0, "6"):
+            self.assertFalse([x for x in self.keys(strata_tune={"spec": bad}) if x.startswith("spec=")], bad)
 
     def test_read_chunks_tune_key(self):
         # setup's calibration of the disk reads' size (#67): 1-16 pieces, nothing else
@@ -701,6 +705,113 @@ class SharedSettings(unittest.TestCase):
             self.svc.api_key = ""
 
 
+class CorsOptIn(unittest.TestCase):
+    """The config's cors_origins: a page on another origin (a local chat client) may call /v1/* from a browser - only the
+    origins listed (or "*"), only /v1/*.  With none listed the server sends no CORS header at all, as before."""
+
+    PAGE = "http://127.0.0.1:8090"
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(RecordingEngine(tok, "</think>\n\nhello", max_context=CTX), tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def setUp(self):
+        self.svc.cors_origins = []
+
+    def tearDown(self):
+        self.svc.cors_origins = []
+
+    def call(self, method, path, headers=None, body=None):
+        h = dict(headers or {})
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            h["Content-Type"] = "application/json"
+        r = urllib.request.Request(self.base + path, data=data, headers=h, method=method)
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                return resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, e.headers, e.read()
+
+    CHAT = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+    def test_without_the_setting_nothing_changes(self):
+        code, h, _ = self.call("OPTIONS", "/v1/chat/completions", {"Origin": self.PAGE, "Access-Control-Request-Method": "POST"})
+        self.assertEqual(code, 403)
+        self.assertIsNone(h.get("Access-Control-Allow-Origin"))
+        code, h, _ = self.call("GET", "/v1/models", {"Origin": self.PAGE})
+        self.assertEqual(code, 200)
+        self.assertIsNone(h.get("Access-Control-Allow-Origin"))
+
+    def test_a_listed_page_gets_its_preflight_and_the_header(self):
+        self.svc.cors_origins = [self.PAGE]
+        code, h, _ = self.call("OPTIONS", "/v1/chat/completions", {
+            "Origin": self.PAGE, "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type,authorization"})
+        self.assertEqual(code, 204)
+        self.assertEqual(h.get("Access-Control-Allow-Origin"), self.PAGE)
+        self.assertEqual(h.get("Vary"), "Origin")
+        self.assertIn("POST", h.get("Access-Control-Allow-Methods"))
+        self.assertEqual(h.get("Access-Control-Allow-Headers"), "content-type,authorization")
+        code, h, _ = self.call("GET", "/v1/models", {"Origin": self.PAGE})
+        self.assertEqual((code, h.get("Access-Control-Allow-Origin")), (200, self.PAGE))
+        code, h, _ = self.call("POST", "/v1/chat/completions", {"Origin": self.PAGE}, self.CHAT)
+        self.assertEqual((code, h.get("Access-Control-Allow-Origin")), (200, self.PAGE))
+        code, h, b = self.call("POST", "/v1/chat/completions", {"Origin": self.PAGE}, {**self.CHAT, "stream": True})
+        self.assertEqual((code, h.get("Access-Control-Allow-Origin")), (200, self.PAGE))   # a stream carries it too
+        self.assertIn(b"data:", b)
+
+    def test_another_page_gets_nothing(self):
+        self.svc.cors_origins = [self.PAGE]
+        for origin in ("http://evil.example", "http://127.0.0.1:8091"):
+            code, h, _ = self.call("OPTIONS", "/v1/models", {"Origin": origin})
+            self.assertEqual(code, 403, origin)
+            self.assertIsNone(h.get("Access-Control-Allow-Origin"), origin)
+            code, h, _ = self.call("GET", "/v1/models", {"Origin": origin})
+            self.assertIsNone(h.get("Access-Control-Allow-Origin"), origin)
+
+    def test_a_trailing_slash_in_the_config_is_forgiven(self):
+        self.svc.cors_origins = parse_cors_origins([self.PAGE + "/"])
+        code, h, _ = self.call("GET", "/v1/models", {"Origin": self.PAGE})
+        self.assertEqual(h.get("Access-Control-Allow-Origin"), self.PAGE)
+
+    def test_star_allows_every_page(self):
+        self.svc.cors_origins = ["*"]
+        code, h, _ = self.call("GET", "/v1/models", {"Origin": "http://anywhere.example"})
+        self.assertEqual((code, h.get("Access-Control-Allow-Origin")), (200, "*"))
+        self.assertIsNone(h.get("Vary"))
+
+    def test_settings_and_the_page_itself_stay_closed(self):
+        self.svc.cors_origins = [self.PAGE]
+        code, h, _ = self.call("OPTIONS", "/settings", {"Origin": self.PAGE})
+        self.assertEqual(code, 403)
+        self.assertIsNone(h.get("Access-Control-Allow-Origin"))
+        code, h, _ = self.call("POST", "/settings", {"Origin": self.PAGE}, {"defaults": {"temperature": 1}})
+        self.assertEqual(code, 403)                      # a listed page may chat, it may not change the settings
+        self.assertIsNone(h.get("Access-Control-Allow-Origin"))
+        code, h, _ = self.call("GET", "/", {"Origin": self.PAGE})
+        self.assertIsNone(h.get("Access-Control-Allow-Origin"))
+
+    def test_the_config_value(self):
+        self.assertEqual(parse_cors_origins(None), [])
+        self.assertEqual(parse_cors_origins([]), [])
+        self.assertEqual(parse_cors_origins([" http://a:1/ ", "*"]), ["http://a:1", "*"])
+        for bad in ("http://a:1", [1], [""], {"a": 1}):
+            with self.assertRaises(ValueError):
+                parse_cors_origins(bad)
+
+
 class WebApp(unittest.TestCase):
     """The web app (PR #22's dashboard idea, rebuilt): its page and files, and GET /metrics."""
 
@@ -922,6 +1033,11 @@ class UsageAndStatus(unittest.TestCase):
         self.assertEqual(s["model"], self.svc.model)
         self.assertEqual(s["context"]["max_positions"], CTX)
         self.assertEqual(s["concurrency"]["serving"], 1)
+        self.engine.multi = 4   # an engine that answers 4 at once (READY ... multi=4, --parallel 4)
+        try:
+            self.assertEqual(json.loads(self.request("/v1/status")[1])["concurrency"]["serving"], 4)
+        finally:
+            self.engine.multi = 0
         self.assertFalse(s["vision"]["available"])
         self.assertEqual(s["activity"]["in_flight"], 0)
         self.assertGreaterEqual(s["activity"]["requests"], 1)

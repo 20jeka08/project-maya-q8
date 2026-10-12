@@ -242,6 +242,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/cuda/glm_fast.cu
                           src/kernels/cuda/glm_batch.cu
+                          src/kernels/cuda/exl3.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -251,6 +252,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_layer_graph_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_layer_graph_test COMMAND glm_layer_graph_test)
     set_tests_properties(glm_layer_graph_test PROPERTIES TIMEOUT 60)
+    # the EXL3 kernels against the scalar CPU reference (random matrices, no model)
+    add_executable(exl3_test tests/exl3_test.cu)
+    target_link_libraries(exl3_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+    add_test(NAME exl3_test COMMAND exl3_test)
+    set_tests_properties(exl3_test PROPERTIES TIMEOUT 120)
   endif()
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
   # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON
@@ -316,10 +322,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
-    src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu)
+    src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
+    src/core/glm_window.cu src/core/glm_dflash.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    # the DFlash2 drafter against a CPU float forward of the same GGUF (glm_dflash_test <draft.gguf>; needs a GPU)
+    # the fast path's multi-column GEMV: every column against the single-column call, and its time (needs a GPU)
+    add_executable(glm_mv_bench tests/glm_mv_bench.cu)
+    target_include_directories(glm_mv_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(glm_mv_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_executable(glm_dflash_test tests/glm_dflash_test.cu)
+    target_include_directories(glm_dflash_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(glm_dflash_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
     add_executable(glm_pack_graph_test tests/glm_pack_graph_test.cpp)
     target_include_directories(glm_pack_graph_test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(glm_pack_graph_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
@@ -715,7 +730,8 @@ if(STRATA_BUILD_TESTS)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3_ref.cpp
+            src/kernels/cpu/exl3_cpu.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -796,6 +812,17 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_split_test src/kernels/cpu/native_split_test.cpp)
     target_link_libraries(native_split_test PRIVATE strata_kernels_cpu)
     add_test(NAME native_split_test COMMAND native_split_test)
+  endif()
+  if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
+    # the dense GEMV for several conversations at once (mv_nt) against the one-conversation GEMV, bit for bit; the
+    # second run with the generic kernel alone (synthetic weights from ggml's quantizers)
+    add_executable(glm_mv_nt_test tests/glm_mv_nt_test.cu)
+    target_include_directories(glm_mv_nt_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(glm_mv_nt_test PRIVATE strata_kernels ggml-base ${_strata_gpu_runtime_target})
+    add_test(NAME glm_mv_nt_test COMMAND glm_mv_nt_test)
+    add_test(NAME glm_mv_nt_generic COMMAND glm_mv_nt_test)
+    set_tests_properties(glm_mv_nt_generic PROPERTIES ENVIRONMENT STRATA_GLM_MV_GENERIC=1)
+    set_tests_properties(glm_mv_nt_test glm_mv_nt_generic PROPERTIES TIMEOUT 300)
   endif()
   if(STRATA_ENABLE_CUDA)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
