@@ -1,0 +1,27 @@
+{
+ "exe": "E:\\progs\\project-maya\\build\\glm_dsa_run.exe",
+ "args": [
+  "--model",
+  "E:\\.lmstudio\\models\\unsloth\\GLM-5.3-GGUF\\GLM-5.3-UD-Q4_K_XL-00001-of-00011.gguf",
+  "--max-context",
+  "16384"
+ ],
+ "env": {
+  "STRATA_GLM_THREADS": "48"
+ },
+ "cwd": "E:\\progs\\project-maya",
+ "tokenizer": "E:\\.lmstudio\\models\\unsloth\\GLM-5.3-GGUF\\glm-dsa\\tokenizer",
+ "model_name": "glm-5.3",
+ "gpu": [
+  1
+ ],
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95
+ },
+ "lib_dirs": [
+  "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\bin"
+ ],
+ "port": 8081,
+ "log": "E:\\progs\\project-maya\\maya-glm53.log"
+}
