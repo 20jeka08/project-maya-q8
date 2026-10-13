@@ -12,6 +12,7 @@
 #include "strata/core/glm_dsa_model.hpp"
 
 #include "glm_dsa_kv.cuh"
+#include "strata/prefill/moe_mmq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -255,6 +256,46 @@ bool GlmDsaModel::gemm(const DevW& w, const float* X, float* Y, int T, std::stri
         PF_CUDA(cudaGetLastError());
         return true;
     }
+    // a chunk: the quantized weight multiplied as it is by llama.cpp's MMQ (int8 tensor cores, the activations to
+    // q8_1 - llama.cpp's own prompt arithmetic), one "expert" over all T rows.  The FP32 path below expanded every
+    // weight to F32 and multiplied in FP32: ~3 ms a token of the prompt (RTX 5090).  STRATA_GLM_PF_MMQ=0 keeps it.
+    static const bool use_mmq = !(std::getenv("STRATA_GLM_PF_MMQ") && std::atoi(std::getenv("STRATA_GLM_PF_MMQ")) == 0) &&
+                                strata::prefill::mmq::built();
+    if (use_mmq && w.type != 0 && strata::prefill::mmq::supported(w.type) && T <= pf_chunk_) {
+        namespace mmq = strata::prefill::mmq;
+        if (!dq_ctx_) {   // this part's context and buffers, sized for a whole chunk of the widest input
+            dq_ctx_ = new mmq::Context();
+            const int64_t max_in = std::max({(int64_t) g_.n_embd, (int64_t) g_.n_head * g_.v_head,
+                                             (int64_t) g_.n_ff_dense, (int64_t) g_.q_lora, (int64_t) 2 * g_.n_embd});
+            PF_CUDA(cudaMalloc(&dq_xq_, mmq::q8_bytes(pf_chunk_, max_in)));
+            allocs_.push_back(dq_xq_);
+            PF_CUDA(cudaMalloc(&dq_bounds_, 2 * sizeof(int)));
+            allocs_.push_back(dq_bounds_);
+            PF_CUDA(cudaMalloc(&dq_iota_, (size_t) pf_chunk_ * sizeof(int)));
+            allocs_.push_back(dq_iota_);
+            mmq::iota(dq_iota_, pf_chunk_, nullptr);
+        }
+        const int b[2] = {0, T};
+        PF_CUDA(cudaMemcpy(dq_bounds_, b, sizeof b, cudaMemcpyHostToDevice));
+        mmq::quantize(X, nullptr, dq_xq_, w.type, w.n_in, w.n_in, T, nullptr);
+        mmq::Product pr;
+        pr.w = w.d;
+        pr.type = w.type;
+        pr.w_rows = w.n_out;
+        pr.w_cols = w.n_in;
+        pr.expert_bytes = mmq::matrix_bytes(w.type, w.n_out, w.n_in);
+        pr.n = 1;
+        pr.xq = dq_xq_;
+        pr.bounds = dq_bounds_;
+        pr.ids = dq_iota_;
+        pr.total_rows = T;
+        pr.max_rows = T;
+        pr.dst = Y;
+        pr.ld_dst = w.n_out;
+        ((mmq::Context*) dq_ctx_)->run(pr, nullptr);
+        PF_CUDA(cudaGetLastError());
+        return true;
+    }
     const float* Wf = (const float*) w.d;
     if (w.type == 8) {
         const int64_t n = w.n_in * w.n_out;
@@ -453,6 +494,7 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
     const bool any_sparse = n_end > g.idx_top_k;
     bool sparse = false;                      // the current selection is a mask (else: every visible cell)
 
+    pf_mark_ = std::chrono::steady_clock::now();
     for (int il = 0; il < g.n_layers; ++il) {
         if (part_of(il) != cur_) {   // the layer split: the chunk's residual to the next device, its selections too
             const float* X_old = X;
@@ -629,7 +671,10 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
                     return false;
                 strata::kernels::glm_swiglu_clamp(GA, UP, INFINITY, (int64_t) T * FS, HH, nullptr);
                 if (!gemm(W(il, "ffn_down_shexp.weight"), HH, SH, T, err)) return false;
+                static const bool ptime = std::getenv("STRATA_GLM_PF_TIME") != nullptr;
+                if (ptime) { cudaDeviceSynchronize(); pf_t_dense_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - pf_mark_).count(); pf_mark_ = std::chrono::steady_clock::now(); }
                 if (!moe_gpu_batch(il, T, XN, RW, hb_ids_.data(), MOE, err)) return false;
+                if (ptime) { cudaDeviceSynchronize(); pf_t_moe_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - pf_mark_).count(); pf_mark_ = std::chrono::steady_clock::now(); }
                 // STRATA_GLM_GPU_MOE_CHECK=1: the CPU path on the same input, the relative difference printed
                 static const bool chk = std::getenv("STRATA_GLM_GPU_MOE_CHECK") && std::atoi(std::getenv("STRATA_GLM_GPU_MOE_CHECK"));
                 if (chk) {
@@ -691,6 +736,7 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
     }
     PF_CUDA(cudaDeviceSynchronize());
     pos_ += T;
+    if (std::getenv("STRATA_GLM_PF_TIME")) std::fprintf(stderr, "prefill time so far: GPU experts %.1f s, everything else %.1f s%c", pf_t_moe_, pf_t_dense_, 10);
     const double total =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
     t_total_ += total;

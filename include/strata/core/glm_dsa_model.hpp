@@ -27,6 +27,7 @@
 #include "strata/kernels/sampler.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -165,6 +166,8 @@ private:
         float *sg = nullptr, *ss = nullptr, *qc = nullptr;
         int *d_sel = nullptr, *d_cnt = nullptr;
         void* iq16 = nullptr;
+        void *dq_ctx = nullptr, *dq_xq = nullptr;   ///< the dense prompt GEMMs through MMQ: context, q8_1 rows
+        int *dq_bounds = nullptr, *dq_iota = nullptr;
         void* gstream = nullptr;
         float* pin = nullptr;
         int* d_pos = nullptr;
@@ -268,6 +271,8 @@ private:
     float *sg_ = nullptr, *ss_ = nullptr, *qc_ = nullptr;   ///< sparse attention: gathered rows, scores, q
     int *d_sel_ = nullptr, *d_cnt_ = nullptr;   ///< the chunk's selections (chunk x top_k, -1 padded) and counts
     void* iq16_ = nullptr;         ///< the indexer's queries in FP16 (chunk x idx_heads x idx_key)
+    void *dq_ctx_ = nullptr, *dq_xq_ = nullptr;   ///< the dense prompt GEMMs through MMQ (Part::dq_*)
+    int *dq_bounds_ = nullptr, *dq_iota_ = nullptr;
     std::vector<int> h_sel_, h_cnt_;
     std::vector<float> hb_x_, hb_ff_, hb_dn_, hb_moe_, hb_rw_, hb_score_;
     std::vector<int> hb_ids_;
@@ -323,6 +328,8 @@ private:
     float* logits_rows_ = nullptr;  ///< verify's logits, 8 x n_vocab (last part)
     float* h_rows_ = nullptr;       ///< verify's post-norm hidden states, 8 x n_embd (last part)
     int diag_n_ = 0;
+    double pf_t_moe_ = 0, pf_t_dense_ = 0;
+    std::chrono::steady_clock::time_point pf_mark_;
 };
 
 }  // namespace strata::core
