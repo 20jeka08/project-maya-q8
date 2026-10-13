@@ -94,6 +94,11 @@ struct GmLane {
     float *gu = nullptr, *h = nullptr, *dn = nullptr;
     float *x = nullptr, *rw = nullptr, *out = nullptr;   ///< a second lane's own copies of the inputs / its sum
     std::vector<void*> allocs;
+    // staging for the layers outside the pinned tier: two pinned group buffers, filled by this lane's own threads
+    // (a parallel memcpy from the memory map) while the other one's DMA runs
+    uint8_t* stage[2] = {};
+    cudaEvent_t staged[2] = {};
+    strata::core::GlmCpuPool* team = nullptr;
 };
 
 struct GmState {
@@ -123,6 +128,11 @@ void GlmDsaModel::gpu_moe_release() {
         }
         if (L.cs) cudaStreamDestroy(L.cs);
             if (L.ks) cudaStreamDestroy(L.ks);
+        for (int b = 0; b < 2; ++b) {
+            if (L.stage[b]) cudaFreeHost(L.stage[b]);
+            if (L.staged[b]) cudaEventDestroy(L.staged[b]);
+        }
+        delete L.team;
         for (void* p : L.allocs) cudaFree(p);
     }
     delete st;
@@ -223,6 +233,24 @@ bool GlmDsaModel::gpu_moe_alloc(int Tmax, std::string& err) {
             err = "glm-dsa: out of device memory for the GPU experts on device " + std::to_string(L.dev) +
                   " (STRATA_GLM_CHUNK smaller, or STRATA_GLM_GPU_MOE=0)";
             return false;
+        }
+        if (!L.team) {
+            int n_team = 8;
+            if (const char* t = std::getenv("STRATA_GLM_STAGE_THREADS")) n_team = std::max(1, std::atoi(t));
+            L.team = new strata::core::GlmCpuPool(n_team);
+            for (int b = 0; b < 2; ++b) {
+                if (cudaHostAlloc((void**) &L.stage[b], (size_t) st->group * st->stride, cudaHostAllocPortable) !=
+                    cudaSuccess) {
+                    cudaGetLastError();
+                    L.stage[b] = nullptr;   // (no room: this lane copies from pageable memory)
+                }
+                GM_CUDA(cudaEventCreateWithFlags(&L.staged[b], cudaEventDisableTiming));
+                GM_CUDA(cudaEventRecord(L.staged[b], L.cs));
+            }
+            if (!L.stage[0] || !L.stage[1]) {
+                for (int b = 0; b < 2; ++b)
+                    if (L.stage[b]) cudaFreeHost(L.stage[b]), L.stage[b] = nullptr;
+            }
         }
         mmq::iota(L.iota, rows, L.ks);
         GM_CUDA(cudaStreamSynchronize(L.ks));
@@ -341,6 +369,41 @@ bool GlmDsaModel::moe_gpu_batch(int il, int T, const float* XN, const float* RW,
             uint8_t* buf = (uint8_t*) ln.w[b];
             GM_CUDA(cudaStreamWaitEvent(cs, ln.free_[b], 0));   // its previous group has multiplied
             const auto& gr = groups[mine[k]];
+            if (!L.pinned && ln.stage[0]) {
+                // outside the pinned tier: the lane's threads copy the group into a pinned staging buffer (the
+                // layout the device buffer takes), then one DMA - the driver's own pageable path stages single-
+                // threaded, ~13 GB/s a card (glm_dsa_pcie_bench: a parallel memcpy into pinned, 31.6 GB/s for two)
+                uint8_t* sb = ln.stage[b];
+                GM_CUDA(cudaEventSynchronize(ln.staged[b]));   // its previous DMA has read it
+                std::vector<std::pair<const uint8_t*, size_t>> src;   // (source, bytes) for each destination piece
+                std::vector<size_t> dst_off;
+                int slot = 0;
+                size_t used = 0;
+                for (int e = gr.first; e < gr.second; ++e, ++slot) {
+                    if (bounds[(size_t) e + 1] == bounds[(size_t) e]) continue;
+                    const size_t o = (size_t) slot * stride;
+                    src.push_back({L.gate + guh * (size_t) e, guh});
+                    dst_off.push_back(o);
+                    src.push_back({L.up + guh * (size_t) e, guh});
+                    dst_off.push_back(o + guh);
+                    src.push_back({L.down + db * (size_t) e, db});
+                    dst_off.push_back(o + 2 * guh);
+                    used = std::max(used, o + 2 * guh + db);
+                }
+                constexpr size_t CH = (size_t) 4 << 20;
+                std::vector<std::pair<int, size_t>> jobs;
+                for (size_t i = 0; i < src.size(); ++i)
+                    for (size_t off = 0; off < src[i].second; off += CH) jobs.push_back({(int) i, off});
+                ln.team->run((int) jobs.size(), [&](int j) {
+                    const auto& jb = jobs[(size_t) j];
+                    const size_t n = std::min(CH, src[(size_t) jb.first].second - jb.second);
+                    std::memcpy(sb + dst_off[(size_t) jb.first] + jb.second, src[(size_t) jb.first].first + jb.second, n);
+                });
+                GM_CUDA(cudaMemcpyAsync(buf, sb, used, cudaMemcpyHostToDevice, cs));
+                GM_CUDA(cudaEventRecord(ln.staged[b], cs));
+                GM_CUDA(cudaEventRecord(ln.ready[b], cs));
+                return true;
+            }
             int slot = 0;
             for (int e = gr.first; e < gr.second; ++e, ++slot) {
                 if (bounds[(size_t) e + 1] == bounds[(size_t) e]) continue;   // no rows: its slot stays unread

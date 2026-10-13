@@ -164,6 +164,7 @@ private:
         void* cublas = nullptr;
         float *pf = nullptr, *pfc = nullptr, *deq = nullptr, *att = nullptr, *pf_score = nullptr;
         float *sg = nullptr, *ss = nullptr, *qc = nullptr;
+        void* att16 = nullptr;
         int *d_sel = nullptr, *d_cnt = nullptr;
         void* iq16 = nullptr;
         void *dq_ctx = nullptr, *dq_xq = nullptr;   ///< the dense prompt GEMMs through MMQ: context, q8_1 rows
@@ -272,6 +273,7 @@ private:
     float* pf_score_ = nullptr;    ///< the indexer's scores of a block of queries (pf_sub_ x max_ctx)
     int pf_dsub_ = 0, pf_ssub_ = 0;  ///< query blocks: dense attention (<= top_k cells), sparse attention
     float *sg_ = nullptr, *ss_ = nullptr, *qc_ = nullptr;   ///< sparse attention: gathered rows, scores, q
+    void* att16_ = nullptr;        ///< sparse attention: the probabilities in FP16
     int *d_sel_ = nullptr, *d_cnt_ = nullptr;   ///< the chunk's selections (chunk x top_k, -1 padded) and counts
     void* iq16_ = nullptr;         ///< the indexer's queries in FP16 (chunk x idx_heads x idx_key)
     void *dq_ctx_ = nullptr, *dq_xq_ = nullptr;   ///< the dense prompt GEMMs through MMQ (Part::dq_*)

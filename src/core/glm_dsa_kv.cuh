@@ -38,6 +38,12 @@ void attend_small_q8(const float* qabs, const float* q, const int8_t* cq, const 
                      int n_sel, const float* vb, float* out, int n_head, int kv_lora, int qk_nope, int qk_rope,
                      int v_head, float scale, cudaStream_t st);
 
+/// gather_q8 into FP16 rows (the prompt's sparse attention multiplies on the tensor cores).
+void gather_q8_f16(const int8_t* q, const __half* s, int row, const int* cells, int n, __half* dst, cudaStream_t st);
+/// concat_q into FP16.
+void concat_q_f16(const float* qabs, const float* q, __half* qc, int T, int n_head, int kv_lora, int qk_nope,
+                  int qk_rope, cudaStream_t st);
+
 /// QC[(t, h), :] = [qabs[t, h, 0..kv_lora) | q[t, h, qk_nope..qk_nope+qk_rope)] for T tokens (576 a row).
 void concat_q(const float* qabs, const float* q, float* qc, int T, int n_head, int kv_lora, int qk_nope, int qk_rope,
               cudaStream_t st);

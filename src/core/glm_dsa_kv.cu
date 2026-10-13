@@ -175,6 +175,30 @@ __global__ void softmax_counted_kernel(float* S, const int* __restrict__ cnt, in
 
 int nb(int64_t n) { return (int) ((n + TB - 1) / TB); }
 
+__global__ void gather_q8_f16_kernel(const int8_t* __restrict__ q, const __half* __restrict__ s, int row,
+                                     const int* __restrict__ cells, int n, __half* __restrict__ dst) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t) n * row) return;
+    const int r = (int) (i / row), e = (int) (i % row);
+    const int cell = cells[r];
+    if (cell < 0) {
+        dst[i] = __float2half(0.0f);
+        return;
+    }
+    const int nblk = row / kBlock;
+    dst[i] = __float2half(__half2float(s[(size_t) cell * nblk + e / kBlock]) * (float) q[(size_t) cell * row + e]);
+}
+
+__global__ void concat_q_f16_kernel(const float* __restrict__ qabs, const float* __restrict__ q, __half* __restrict__ qc,
+                                    int T, int n_head, int kv_lora, int qk_nope, int qk_rope) {
+    const int row = kv_lora + qk_rope;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t) T * n_head * row) return;
+    const int64_t r = i / row;
+    const int e = (int) (i % row);
+    qc[i] = __float2half(e < kv_lora ? qabs[r * kv_lora + e] : q[r * (qk_nope + qk_rope) + qk_nope + (e - kv_lora)]);
+}
+
 /// float -> a key whose unsigned order is the float order
 __device__ __forceinline__ uint32_t fkey(float f) {
     const uint32_t u = __float_as_uint(f);
@@ -267,6 +291,16 @@ __global__ void topk_rows_kernel(const float* __restrict__ scores, int64_t ld, i
 }
 
 }  // namespace
+
+void gather_q8_f16(const int8_t* q, const __half* s, int row, const int* cells, int n, __half* dst, cudaStream_t st) {
+    gather_q8_f16_kernel<<<nb((int64_t) n * row), TB, 0, st>>>(q, s, row, cells, n, dst);
+}
+
+void concat_q_f16(const float* qabs, const float* q, __half* qc, int T, int n_head, int kv_lora, int qk_nope,
+                  int qk_rope, cudaStream_t st) {
+    concat_q_f16_kernel<<<nb((int64_t) T * n_head * (kv_lora + qk_rope)), TB, 0, st>>>(qabs, q, qc, T, n_head,
+                                                                                      kv_lora, qk_nope, qk_rope);
+}
 
 void topk_rows(const float* scores, int64_t ld, int rows, int n_fixed, int vis0, int K, int* out, int64_t out_ld,
                int* cnt, cudaStream_t st) {

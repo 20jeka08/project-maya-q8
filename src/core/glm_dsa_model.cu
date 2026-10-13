@@ -1195,12 +1195,14 @@ void GlmDsaModel::bind(int i) {
         Part& o = parts_[(size_t) cur_];
         o.sc = sc_, o.q8 = q8_, o.d_cells = d_cells_, o.kvg = kvg_, o.ikv = ikv_, o.cublas = cublas_;
         o.pf = pf_, o.pfc = pfc_, o.deq = deq_, o.att = att_, o.pf_score = pf_score_, o.sg = sg_, o.ss = ss_, o.qc = qc_;
+        o.att16 = att16_;
         o.d_sel = d_sel_, o.d_cnt = d_cnt_, o.iq16 = iq16_, o.gstream = gstream_, o.pin = pin_, o.d_pos = d_pos_;
         o.dq_ctx = dq_ctx_, o.dq_xq = dq_xq_, o.dq_bounds = dq_bounds_, o.dq_iota = dq_iota_;
     }
     const Part& p = parts_[(size_t) i];
     sc_ = p.sc, q8_ = p.q8, d_cells_ = p.d_cells, kvg_ = p.kvg, ikv_ = p.ikv, cublas_ = p.cublas;
     pf_ = p.pf, pfc_ = p.pfc, deq_ = p.deq, att_ = p.att, pf_score_ = p.pf_score, sg_ = p.sg, ss_ = p.ss, qc_ = p.qc;
+    att16_ = p.att16;
     d_sel_ = p.d_sel, d_cnt_ = p.d_cnt, iq16_ = p.iq16, gstream_ = p.gstream, pin_ = p.pin, d_pos_ = p.d_pos;
     dq_ctx_ = p.dq_ctx, dq_xq_ = p.dq_xq, dq_bounds_ = p.dq_bounds, dq_iota_ = p.dq_iota;
     cur_ = i;

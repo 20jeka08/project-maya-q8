@@ -241,6 +241,8 @@ bool GlmDsaModel::pf_alloc(std::string& err) {
     allocs_.push_back(sg_);
     PF_CUDA(cudaMalloc(&ss_, (size_t) pf_ssub_ * g.n_head * K * sizeof(float)));
     allocs_.push_back(ss_);
+    PF_CUDA(cudaMalloc(&att16_, (size_t) pf_ssub_ * g.n_head * K * sizeof(__half)));
+    allocs_.push_back(att16_);
     PF_CUDA(cudaMalloc(&qc_, (size_t) pf_ssub_ * g.n_head * CR * sizeof(float)));
     allocs_.push_back(qc_);
     PF_CUDA(cudaMalloc(&d_sel_, (size_t) T * K * sizeof(int)));
@@ -650,7 +652,33 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
             } else {
                 // each query's own (up to) top_k cells gathered, then batched GEMMs per query: scores, softmax, context
                 const int K = g.idx_top_k;
-                for (int t0 = 0; t0 < T; t0 += pf_ssub_) {
+                // FP16 operands on the tensor cores, FP32 accumulation and softmax: the FP32 path below wrote K x 576
+                // floats a query a layer and multiplied in FP32 - most of a long prompt's non-expert time (12.5K tokens:
+                // ~20 s).  STRATA_GLM_ATT_F32=1 keeps it.
+                static const bool att_f32 = std::getenv("STRATA_GLM_ATT_F32") && std::atoi(std::getenv("STRATA_GLM_ATT_F32"));
+                if (!att_f32) {
+                    __half* G16 = (__half*) sg_;      // (the F32 buffer holds the FP16 rows twice over)
+                    __half* Q16 = (__half*) qc_;
+                    __half* P16 = (__half*) att16_;
+                    for (int t0 = 0; t0 < T; t0 += pf_ssub_) {
+                        const int ts = std::min(pf_ssub_, T - t0);
+                        kv::gather_q8_f16(kv_q(il), (const __half*) kv_s(il), CR, d_sel_ + (size_t) t0 * K, ts * K, G16,
+                                          nullptr);
+                        kv::concat_q_f16(QA + (size_t) t0 * H * KL, Q + (size_t) t0 * H * QH, Q16, ts, H, KL, g.qk_nope,
+                                         g.qk_rope, nullptr);
+                        PF_BLAS(cublasGemmStridedBatchedEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, K, H, CR, &kq_scale, G16, CUDA_R_16F,
+                                                           CR, (long long) K * CR, Q16, CUDA_R_16F, CR, (long long) H * CR,
+                                                           &zero, ss_, CUDA_R_32F, K, (long long) H * K, ts,
+                                                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                        kv::softmax_counted(ss_, d_cnt_ + t0, ts, H, K, nullptr);
+                        kv::to_f16(ss_, P16, (int64_t) ts * H * K, nullptr);
+                        PF_BLAS(cublasGemmStridedBatchedEx(cb, CUBLAS_OP_N, CUBLAS_OP_N, KL, H, K, &one, G16, CUDA_R_16F, CR,
+                                                           (long long) K * CR, P16, CUDA_R_16F, K, (long long) H * K, &zero,
+                                                           QA + (size_t) t0 * H * KL, CUDA_R_32F, KL, (long long) H * KL,
+                                                           ts, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                    }
+                }
+                for (int t0 = 0; t0 < T && att_f32; t0 += pf_ssub_) {
                     const int ts = std::min(pf_ssub_, T - t0);
                     kv::gather_q8(kv_q(il), (const __half*) kv_s(il), CR, d_sel_ + (size_t) t0 * K, 0, ts * K, sg_,
                                   nullptr);
