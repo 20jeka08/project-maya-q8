@@ -657,8 +657,15 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
     }
 
     // 4. the routed experts: mmap views, one NativeFmt per layer
-    experts_.assign((size_t) g.n_layers, ExpertLayer{});
-    for (int il = g.dense_lead; il < g.n_layers; ++il) {
+    // the draft (MTP) layer, index n_layers, loaded only with STRATA_GLM_MTP=1: measured on this box (EPYC 7K62,
+    // RTX 5090, UD-Q4_K_XL) its drafts are accepted 67-77% of the time, but a verify window reads the union of two
+    // tokens' experts from RAM (1.65x the bytes a token, measured over a story's routes), so speculative decoding
+    // ran 240 ms a token against 190 without it - decode here is bound by RAM bandwidth, not by passes
+    mtp_ = g.nextn > 0 && std::getenv("STRATA_GLM_MTP") && std::atoi(std::getenv("STRATA_GLM_MTP")) == 1 &&
+           find("blk." + std::to_string(g.n_layers) + ".nextn.eh_proj.weight") != nullptr;
+    const int n_moe_end = g.n_layers + (mtp_ ? 1 : 0);
+    experts_.assign((size_t) n_moe_end, ExpertLayer{});
+    for (int il = g.dense_lead; il < n_moe_end; ++il) {
         const std::string L = "blk." + std::to_string(il) + ".";
         const strata::GgufFile *fg = nullptr, *fu = nullptr, *fd = nullptr;
         const strata::TensorInfo* tg = find(L + "ffn_gate_exps.weight", &fg);
@@ -698,9 +705,9 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
     int64_t n_full = 0;
     for (int il = 0; il < g.n_layers; ++il)
         if (g.indexer_full[(size_t) il]) ik_slot_[(size_t) il] = n_full++;
-    kvq_l_.assign((size_t) g.n_layers, nullptr);
-    kvs_l_.assign((size_t) g.n_layers, nullptr);
-    ik_l_.assign((size_t) g.n_layers, nullptr);
+    kvq_l_.assign((size_t) g.n_layers + 1, nullptr);
+    kvs_l_.assign((size_t) g.n_layers + 1, nullptr);
+    ik_l_.assign((size_t) g.n_layers + 1, nullptr);
     const size_t scratch = (size_t) 16 * g.n_embd + (size_t) 4 * g.n_head * g.qk_head() +
                            (size_t) 2 * g.n_head * g.kv_lora + (size_t) 4 * g.n_ff_dense +
                            (size_t) g.idx_heads * g.idx_key + (size_t) max_ctx + (size_t) g.n_vocab + 4096;
@@ -733,10 +740,48 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
         allocs_.push_back(p.ikv);
         GD_CHECK(cudaMalloc(&p.sc, scratch * sizeof(float)));
         allocs_.push_back(p.sc);
-        GD_CHECK(cudaMalloc(&p.q8, strata::kernels::native_q8_1_bytes(max_in)));
+        GD_CHECK(cudaMalloc(&p.q8, strata::kernels::native_q8_1_bytes(max_in, 8)));   // (up to 8 columns: verify)
         allocs_.push_back(p.q8);
         GD_CHECK(cudaMalloc(&p.d_cells, (size_t) g.idx_top_k * sizeof(int)));
         allocs_.push_back(p.d_cells);
+    }
+    // the draft (MTP) layer on the last part, beside the head it shares: its weights, its int8 cache, its residual
+    if (mtp_) {
+        GD_CHECK(cudaSetDevice(parts_.back().dev));
+        const std::string L = "blk." + std::to_string(g.n_layers) + ".";
+        for (const char* t : quant)
+            if (std::string(t).rfind("indexer.", 0) != 0 && !upload(L + t, true, err)) return false;
+        for (const char* t : f32)
+            if (std::string(t).rfind("indexer.", 0) != 0 && !upload(L + t, false, err)) return false;
+        for (const char* t : shexp)
+            if (!upload(L + t, true, err)) return false;
+        for (const char* t : router)
+            if (!upload(L + t, false, err)) return false;
+        if (!upload(L + "nextn.eh_proj.weight", true, err) || !upload(L + "nextn.enorm.weight", false, err) ||
+            !upload(L + "nextn.hnorm.weight", false, err))
+            return false;
+        // (shared_head_norm is optional in the format: the trunk's output_norm stands in)
+        mtp_head_norm_ = find(L + "nextn.shared_head_norm.weight") ? L + "nextn.shared_head_norm.weight"
+                                                                    : std::string("output_norm.weight");
+        if (mtp_head_norm_ != "output_norm.weight" && !upload(mtp_head_norm_, false, err)) return false;
+        int8_t* q = nullptr;
+        __half* sc = nullptr;
+        GD_CHECK(cudaMalloc(&q, (size_t) max_ctx * g.cache_row()));
+        allocs_.push_back(q);
+        GD_CHECK(cudaMalloc(&sc, (size_t) max_ctx * (g.cache_row() / kv::kBlock) * sizeof(__half)));
+        allocs_.push_back(sc);
+        kvq_l_[(size_t) g.n_layers] = q;
+        kvs_l_[(size_t) g.n_layers] = sc;
+        GD_CHECK(cudaMalloc(&h_last_, (size_t) g.n_embd * sizeof(float)));
+        allocs_.push_back(h_last_);
+        GD_CHECK(cudaMalloc(&mtp_buf_, (size_t) (2 * g.n_embd + 2 * g.n_embd + g.n_vocab) * sizeof(float)));
+        allocs_.push_back(mtp_buf_);
+        GD_CHECK(cudaMalloc(&logits_rows_, (size_t) 8 * g.n_vocab * sizeof(float)));
+        allocs_.push_back(logits_rows_);
+        GD_CHECK(cudaMalloc(&h_rows_, (size_t) 8 * g.n_embd * sizeof(float)));
+        allocs_.push_back(h_rows_);
+        std::fprintf(stderr, "glm-dsa: the MTP draft layer (blk.%d) loaded on device %d\n", g.n_layers,
+                     parts_.back().dev);
     }
     // the head's buffers on the last part
     GD_CHECK(cudaSetDevice(parts_.back().dev));
@@ -1046,6 +1091,7 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
 
     if (logits || head) {
         rms_norm_kernel<<<1, T_>>>(x, (const float*) w_.at("output_norm.weight").d, xn, g.n_embd, g.norm_eps);
+        if (h_last_) GD_CHECK(cudaMemcpy(h_last_, xn, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice));
         if (!gemv(w_.at("output.weight"), xn, d_logits, err)) return false;
         d_logits_ = d_logits;
         if (logits)
@@ -1140,6 +1186,145 @@ bool GlmDsaModel::attend_one(int il, int n_sel, bool sparse, bool blas, const fl
         if (!decode_attend(kvg_, n_sel - 1, q, qabs, o, vb, false, err)) return false;
     }
     GD_CHECK(cudaGetLastError());
+    return true;
+}
+
+/// The draft (MTP) layer at position pos() for `token`, as llama.cpp's glm-dsa graph_mtp builds it:
+///   x = eh_proj . [enorm * rms(embed(token)) | hnorm * rms(h)]   (h: the trunk's post-norm hidden state)
+///   then one decoder block - MLA attention over the MTP layer's own cache (dense: the indexer is not used), the
+///   sigmoid-routed MoE with the shared expert - then shared_head_norm and the shared head.  Returns its argmax.
+int GlmDsaModel::mtp_draft(int32_t token, std::string& err, int64_t at) {
+    const GlmDsaGeometry& g = g_;
+    if (!mtp_) {
+        err = "glm-dsa: the MTP layer is not loaded";
+        return -1;
+    }
+    const int il = g.n_layers, p = (int) (at >= 0 ? at : pos_), E = g.n_embd;
+    bind((int) parts_.size() - 1);
+    // the step path's scratch (its residual is not needed once the trunk's head has run) and the MTP's own
+    float* xn = sc_ + E;
+    float* tmp = xn + E;
+    float* moe = tmp + E;
+    float* sh = moe + E;
+    float* router = sh + E;
+    float* rw = router + 4 * E;
+    int* ids = (int*) (rw + 64);
+    float* qr = (float*) (ids + 64);
+    float* kvpe = qr + g.q_lora;
+    float* q = kvpe + g.cache_row();
+    float* qabs = q + (size_t) g.n_head * g.qk_head();
+    float* o = qabs + (size_t) g.n_head * g.kv_lora;
+    float* gate = o + (size_t) g.n_head * g.v_head;
+    float* up = gate + g.n_ff_dense;
+    float* hh = up + g.n_ff_dense;
+    float* x = mtp_buf_;
+    float* cat = x + E;
+    float* lg = cat + 3 * E;
+    const auto fail = [&](const std::string& e) {
+        err = e;
+        return -1;
+    };
+#define MTP_CK(call)                                                                                    \
+    do {                                                                                                \
+        const cudaError_t e_ = (call);                                                                  \
+        if (e_ != cudaSuccess) return fail(std::string("cuda: ") + #call + ": " + cudaGetErrorString(e_)); \
+    } while (0)
+    {
+        const size_t row = ggml_row_size((ggml_type) tok_embd_->type, E);
+        ggml_get_type_traits((ggml_type) tok_embd_->type)
+            ->to_float(tok_embd_file_->tensor_data(*tok_embd_) + row * (size_t) token, h_embd_.data(), E);
+        MTP_CK(cudaMemcpy(cat, h_embd_.data(), (size_t) E * sizeof(float), cudaMemcpyHostToDevice));
+    }
+    rms_norm_kernel<<<1, T_>>>(cat, (const float*) W(il, "nextn.enorm.weight").d, cat, E, g.norm_eps);
+    rms_norm_kernel<<<1, T_>>>(h_last_, (const float*) W(il, "nextn.hnorm.weight").d, cat + E, E, g.norm_eps);
+    if (!gemv(W(il, "nextn.eh_proj.weight"), cat, x, err)) return -1;
+
+    const float theta_scale = std::pow(g.rope_base, -2.0f / (float) g.qk_rope);
+    static const int blas_min = std::getenv("STRATA_GLM_BLAS_MIN") ? std::atoi(std::getenv("STRATA_GLM_BLAS_MIN")) : 1024;
+    rms_norm_kernel<<<1, T_>>>(x, (const float*) W(il, "attn_norm.weight").d, xn, E, g.norm_eps);
+    if (!gemv(W(il, "attn_q_a.weight"), xn, qr, err)) return -1;
+    rms_norm_kernel<<<1, T_>>>(qr, (const float*) W(il, "attn_q_a_norm.weight").d, qr, g.q_lora, g.norm_eps);
+    if (!gemv(W(il, "attn_kv_a_mqa.weight"), xn, kvpe, err)) return -1;
+    rms_norm_kernel<<<1, T_>>>(kvpe, (const float*) W(il, "attn_kv_a_norm.weight").d, kvpe, g.kv_lora, g.norm_eps);
+    rope_norm_kernel<<<nblk(g.qk_rope / 2), T_>>>(kvpe, 1, g.cache_row(), g.kv_lora, g.qk_rope, p, theta_scale);
+    kv::store_q8(kvpe, 1, g.cache_row(), g.cache_row(), kv_q(il), (__half*) kv_s(il), p, nullptr, nullptr);
+    if (!gemv(W(il, "attn_q_b.weight"), qr, q, err)) return -1;
+    rope_norm_kernel<<<nblk(g.n_head * g.qk_rope / 2), T_>>>(q, g.n_head, g.qk_head(), g.qk_nope, g.qk_rope, p,
+                                                             theta_scale);
+    q_absorb_kernel<<<nblk((int64_t) g.n_head * g.kv_lora * 32), T_>>>((const float*) W(il, "attn_k_b.weight").d, q,
+                                                                      qabs, g.qk_nope, g.qk_head(), g.kv_lora, g.n_head);
+    if (!attend_one(il, p + 1, false, p + 1 > blas_min, q, qabs, o, nullptr, err)) return -1;
+    if (!gemv(W(il, "attn_output.weight"), o, tmp, err)) return -1;
+    add_kernel<<<nblk(E), T_>>>(x, tmp, E);
+
+    rms_norm_kernel<<<1, T_>>>(x, (const float*) W(il, "ffn_norm.weight").d, xn, E, g.norm_eps);
+    if (!gemv(W(il, "ffn_gate_inp.weight"), xn, router, err)) return -1;
+    strata::kernels::router_sigmoid(router, (const float*) W(il, "exp_probs_b.bias").d, 1, g.n_expert, g.n_exp_used,
+                                    g.w_scale, g.norm_w != 0, ids, rw, cudaStreamLegacy);
+    std::vector<int> h_ids((size_t) g.n_exp_used);
+    std::vector<float> h_rw((size_t) g.n_exp_used);
+    MTP_CK(cudaMemcpy(h_ids.data(), ids, h_ids.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    MTP_CK(cudaMemcpy(h_rw.data(), rw, h_rw.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    MTP_CK(cudaMemcpy(h_x_.data(), xn, (size_t) E * sizeof(float), cudaMemcpyDeviceToHost));
+    if (!gemv(W(il, "ffn_gate_shexp.weight"), xn, gate, err) || !gemv(W(il, "ffn_up_shexp.weight"), xn, up, err))
+        return -1;
+    strata::kernels::glm_swiglu_clamp(gate, up, INFINITY, (int64_t) g.n_ff_exp * g.n_shared, hh, cudaStreamLegacy);
+    if (!gemv(W(il, "ffn_down_shexp.weight"), hh, sh, err)) return -1;
+    if (!moe_cpu(il, h_ids, h_rw, err)) return -1;
+    MTP_CK(cudaMemcpy(moe, h_moe_.data(), (size_t) E * sizeof(float), cudaMemcpyHostToDevice));
+    add_kernel<<<nblk(E), T_>>>(moe, sh, E);
+    add_kernel<<<nblk(E), T_>>>(x, moe, E);
+
+    rms_norm_kernel<<<1, T_>>>(x, (const float*) w_.at(mtp_head_norm_).d, xn, E, g.norm_eps);
+    if (!gemv(w_.at("output.weight"), xn, lg, err)) return -1;
+    strata::kernels::SamplerParams sp;
+    sp.greedy = true;
+    strata::kernels::sample_tokens(lg, 1, g.n_vocab, nullptr, 0, sp, d_tok_, cudaStreamLegacy);
+    int tok = -1;
+    MTP_CK(cudaMemcpy(&tok, d_tok_, sizeof(int), cudaMemcpyDeviceToHost));
+#undef MTP_CK
+    return tok;
+}
+
+bool GlmDsaModel::verify(const int32_t* toks, int T, std::string& err) {
+    if (T < 1 || T > 8 || !logits_rows_) {
+        err = "glm-dsa: verify takes 1-8 tokens (and the MTP layer loaded)";
+        return false;
+    }
+    if (pos_ + T > max_ctx_) {
+        err = "glm-dsa: context full";
+        return false;
+    }
+    bind(0);
+    if (!pf_alloc(err)) return false;
+    all_rows_ = true;
+    const bool ok = prefill_chunk(toks, T, true, err);
+    all_rows_ = false;
+    return ok;
+}
+
+int GlmDsaModel::sample_row(int r, const strata::kernels::SamplerParams& sp, std::string& err) {
+    if (cudaSetDevice(parts_.back().dev) != cudaSuccess) {
+        err = "glm-dsa: cudaSetDevice failed";
+        return -1;
+    }
+    strata::kernels::SamplerParams p = sp;
+    if (p.temperature <= 0.0f) p.greedy = true;
+    strata::kernels::sample_tokens(logits_rows_ + (size_t) r * g_.n_vocab, 1, g_.n_vocab, nullptr, 0, p, d_tok_,
+                                   cudaStreamLegacy);
+    int tok = -1;
+    const cudaError_t e = cudaMemcpy(&tok, d_tok_, sizeof(int), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        err = std::string("glm-dsa: sample_row: ") + cudaGetErrorString(e);
+        return -1;
+    }
+    return tok;
+}
+
+bool GlmDsaModel::use_h_row(int r, std::string& err) {
+    GD_CHECK(cudaSetDevice(parts_.back().dev));
+    GD_CHECK(cudaMemcpy(h_last_, h_rows_ + (size_t) r * g_.n_embd, (size_t) g_.n_embd * sizeof(float),
+                        cudaMemcpyDeviceToDevice));
     return true;
 }
 
@@ -1482,6 +1667,8 @@ bool GlmDsaModel::step_graph(int32_t token, float* logits, std::string& err, boo
 
     if (logits || head) {
         rms_norm_kernel<<<1, T_, 0, s>>>(x, (const float*) w_.at("output_norm.weight").d, xn, g.n_embd, g.norm_eps);
+        if (h_last_)
+            GD_CHECK(cudaMemcpyAsync(h_last_, xn, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, s));
         if (!gemv_s(w_.at("output.weight"), xn, d_logits_buf_, s, err)) return false;
         d_logits_ = d_logits_buf_;
         if (logits)

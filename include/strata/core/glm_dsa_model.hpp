@@ -117,6 +117,16 @@ public:
     }
     const std::vector<float>& captured_ids() const { return cap_ids_; }   ///< per layer: k ids then k weights
     const std::vector<float>& captured() const { return cap_; }
+    /// The draft (MTP) layer: whether it is loaded; mtp_draft(token) runs it at position pos() - the token the
+    /// trunk will read next, with the trunk's last post-norm hidden state - and returns its greedy guess for the token
+    /// after it (-1 with `err`).  The MTP layer keeps its own cache, one row a position.
+    bool mtp() const { return mtp_; }
+    int mtp_draft(int32_t token, std::string& err, int64_t at = -1);   ///< at >= 0: that position, not pos()
+    /// Speculative decoding's verify: appends T (<= 8) tokens like prefill, but the head runs for every one of them -
+    /// their logits for sample_row(r), their post-norm hidden states for use_h_row(r) (the MTP layer's next input).
+    bool verify(const int32_t* toks, int T, std::string& err);
+    int sample_row(int r, const strata::kernels::SamplerParams& sp, std::string& err);
+    bool use_h_row(int r, std::string& err);
     /// Copies the last head's n_vocab logits to the host.
     bool read_logits(float* out, std::string& err);
     /// Forgets the sequence (the caches are overwritten from position 0).
@@ -305,6 +315,13 @@ private:
     float* moe_y_ = nullptr;
     int prof_n_ = 0;
     double diag_pos_ = 0, diag_sync_ = 0, diag_hand_ = 0;
+    bool mtp_ = false;
+    std::string mtp_head_norm_;
+    float* h_last_ = nullptr;       ///< the trunk's last post-norm hidden state (the MTP layer's input), last part
+    float* mtp_buf_ = nullptr;      ///< the MTP forward's own buffers: residual, cat, its logits
+    bool all_rows_ = false;         ///< the next chunk's head runs for every row (verify)
+    float* logits_rows_ = nullptr;  ///< verify's logits, 8 x n_vocab (last part)
+    float* h_rows_ = nullptr;       ///< verify's post-norm hidden states, 8 x n_embd (last part)
     int diag_n_ = 0;
 };
 

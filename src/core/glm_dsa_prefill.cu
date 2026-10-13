@@ -12,6 +12,8 @@
 #include "strata/core/glm_dsa_model.hpp"
 
 #include "glm_dsa_kv.cuh"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/glm_ffn.hpp"
@@ -246,6 +248,13 @@ bool GlmDsaModel::pf_alloc(std::string& err) {
 }
 
 bool GlmDsaModel::gemm(const DevW& w, const float* X, float* Y, int T, std::string& err) {
+    // up to 8 tokens (a verify window): the quantized weights dotted by MMVQ, read once for all the columns
+    if (w.type != 0 && T <= 8 && strata::kernels::native_mmvq_supported(w.type)) {
+        strata::kernels::quantize_q8_1_rows(X, T, w.n_in, q8_, cudaStreamLegacy);
+        strata::kernels::native_mmvq(w.type, w.d, q8_, Y, (int) w.n_in, (int) w.n_out, T, cudaStreamLegacy);
+        PF_CUDA(cudaGetLastError());
+        return true;
+    }
     const float* Wf = (const float*) w.d;
     if (w.type == 8) {
         const int64_t n = w.n_in * w.n_out;
@@ -665,9 +674,18 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
         capture(il, 1, X + (size_t) (T - 1) * E);
     }
 
+    if (head && all_rows_) {   // verify: every row's head, every row's post-norm hidden state
+        rms_rows_kernel<<<T, TB>>>(X, (const float*) w_.at("output_norm.weight").d, XN, E, E, E, g.norm_eps);
+        PF_CUDA(cudaMemcpy(h_rows_, XN, (size_t) TE * sizeof(float), cudaMemcpyDeviceToDevice));
+        PF_CUDA(cudaMemcpy(h_last_, XN + (size_t) (T - 1) * E, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice));
+        if (!gemm(w_.at("output.weight"), XN, logits_rows_, T, err)) return false;
+        d_logits_ = logits_rows_ + (size_t) (T - 1) * g.n_vocab;
+        head = false;
+    }
     if (head) {
         float* xl = X + (size_t) (T - 1) * E;
         rms_rows_kernel<<<1, TB>>>(xl, (const float*) w_.at("output_norm.weight").d, XN, E, E, E, g.norm_eps);
+        if (h_last_) PF_CUDA(cudaMemcpy(h_last_, XN, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice));
         if (!gemv(w_.at("output.weight"), XN, d_logits_buf_, err)) return false;
         d_logits_ = d_logits_buf_;
     }

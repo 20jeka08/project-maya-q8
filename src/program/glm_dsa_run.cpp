@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -261,6 +262,156 @@ int serve(strata::core::GlmDsaModel& m) {
 
 // the batched prompt against the token-by-token one (which matches llama.cpp): the last prompt position's logits
 // and the greedy continuation that follows each.
+// ---------------------------------------------------------------- speculative decoding with the MTP layer
+// One draft a round: the MTP layer guesses the token after `t`, the trunk reads [t, draft] in one verify pass (the
+// draft's experts mostly differ from t's, but the weights of each are read once), and the first row's sample is
+// the next token.  When it IS the draft, the draft's cache cell stays, the MTP layer's cache gets the draft's
+// position, and the second row's sample is a token more; otherwise the draft's cell is rewound.  Every emitted
+// token is sampled from the trunk's own logits, so the text is the one plain decoding would sample.
+// Stats: rounds, accepted drafts.  `emit(token)` returns false to stop (EOS, max_new, a STOP).
+struct SpecStats {
+    int rounds = 0, accepted = 0;
+};
+
+// on entry the trunk has read the context and its head ran (sample() gives the next token); returns false on error
+bool spec_generate(strata::core::GlmDsaModel& m, strata::kernels::SamplerParams& sp, uint64_t& draws,
+                   const std::function<bool(int32_t)>& emit, const std::function<void(int32_t)>& consumed,
+                   SpecStats& st, std::string& err) {
+    sp.counter = draws++;
+    int32_t t = m.sample(sp, err);
+    if (t < 0) return false;
+    if (!emit(t)) return true;
+    for (;;) {
+        if (m.pos() + 2 > m.max_ctx()) return true;   // the context is full
+        const int64_t P = m.pos();
+        const int32_t d = m.mtp_draft(t, err);
+        if (d < 0) return false;
+        const int32_t win[2] = {t, d};
+        if (!m.verify(win, 2, err)) return false;
+        consumed(t);
+        ++st.rounds;
+        sp.counter = draws++;
+        const int32_t t2 = m.sample_row(0, sp, err);
+        if (t2 < 0) return false;
+        if (t2 != d) {   // the draft missed: its cell goes, t2 is read next round
+            m.rewind(P + 1);
+            if (!m.use_h_row(0, err)) return false;
+            if (!emit(t2)) return true;
+            t = t2;
+            continue;
+        }
+        ++st.accepted;
+        consumed(d);
+        // the MTP layer's cache for the draft's position (its input: the hidden state after t)
+        if (!m.use_h_row(0, err) || m.mtp_draft(d, err, P + 1) < 0) return false;
+        if (!m.use_h_row(1, err)) return false;
+        if (!emit(t2)) return true;
+        sp.counter = draws++;
+        const int32_t t3 = m.sample_row(1, sp, err);
+        if (t3 < 0) return false;
+        if (!emit(t3)) return true;
+        t = t3;
+    }
+}
+
+// --mtp-eval: how often the MTP layer's draft is the token the trunk then reads (prompt) or picks (greedy).  Every
+// position runs the trunk (step, its head on) and then the draft for the position after the next token.
+int mtp_eval(strata::core::GlmDsaModel& m, const std::vector<int32_t>& prompt, int gen) {
+    std::string err;
+    if (!m.mtp()) {
+        std::fprintf(stderr, "the model has no MTP layer loaded\n");
+        return 1;
+    }
+    strata::kernels::SamplerParams sp;
+    sp.greedy = true;
+    std::vector<int32_t> seq = prompt;
+    std::vector<int> pending;   // pending[j]: the draft for position j (-1: none)
+    int acc_p = 0, tot_p = 0, acc_g = 0, tot_g = 0, generated = 0;
+    double t_step = 0, t_draft = 0;
+    for (size_t j = 0;; ++j) {
+        const int32_t tok = seq[j];
+        if (j < pending.size() && pending[j] >= 0) {
+            const bool hit = pending[j] == tok;
+            if (j < prompt.size()) tot_p++, acc_p += hit;
+            else tot_g++, acc_g += hit;
+        }
+        auto a = std::chrono::steady_clock::now();
+        if (!m.step(tok, nullptr, err, true)) {
+            std::fprintf(stderr, "step: %s\n", err.c_str());
+            return 1;
+        }
+        t_step += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+        int32_t nxt;
+        if (j + 1 < seq.size()) {
+            nxt = seq[j + 1];
+        } else {
+            if (generated >= gen) break;
+            nxt = m.sample(sp, err);
+            if (nxt < 0) return 1;
+            seq.push_back(nxt);
+            ++generated;
+        }
+        a = std::chrono::steady_clock::now();
+        const int d = m.mtp_draft(nxt, err);
+        if (d < 0) {
+            std::fprintf(stderr, "draft: %s\n", err.c_str());
+            return 1;
+        }
+        t_draft += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+        if (pending.size() < j + 3) pending.resize(j + 3, -1);
+        pending[j + 2] = d;
+    }
+    const int n = (int) seq.size();
+    std::printf("{\"mtp_accept_prompt\":%.3f,\"n_prompt\":%d,\"mtp_accept_gen\":%.3f,\"n_gen\":%d,"
+                "\"step_ms\":%.1f,\"draft_ms\":%.1f}\n",
+                tot_p ? (double) acc_p / tot_p : 0.0, tot_p, tot_g ? (double) acc_g / tot_g : 0.0, tot_g, t_step / n,
+                t_draft / n);
+    std::printf("{\"generated\":[");
+    for (size_t i = prompt.size(); i < seq.size(); ++i) std::printf("%s%d", i > prompt.size() ? "," : "", seq[i]);
+    std::printf("]}\n");
+    return 0;
+}
+
+int spec_gen(strata::core::GlmDsaModel& m, const std::vector<int32_t>& prompt, int gen) {
+    std::string err;
+    if (!m.mtp()) {
+        std::fprintf(stderr, "the model has no MTP layer loaded\n");
+        return 1;
+    }
+    if (!m.prefill(prompt.data(), (int64_t) prompt.size(), err, true)) {
+        std::fprintf(stderr, "prefill: %s\n", err.c_str());
+        return 1;
+    }
+    strata::kernels::SamplerParams sp;
+    sp.greedy = true;
+    uint64_t draws = 0;
+    SpecStats st;
+    std::vector<int32_t> out;
+    double d0, c0, a0;
+    m.take_timing(d0, c0, a0);   // (the prompt's time out of the counters)
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = spec_generate(m, sp, draws, [&](int32_t tok) {
+        out.push_back(tok);
+        return (int) out.size() < gen;
+    }, [](int32_t) {}, st, err);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (!ok) {
+        std::fprintf(stderr, "spec: %s\n", err.c_str());
+        return 1;
+    }
+    double dev_ms = 0, cpu_ms = 0, tot_ms = 0;
+    m.take_timing(dev_ms, cpu_ms, tot_ms);
+    std::fprintf(stderr, "spec timing per round: trunk+mtp device %.1f ms, cpu experts %.1f ms (of %.1f ms in the model)\n",
+                 dev_ms / std::max(1, st.rounds), cpu_ms / std::max(1, st.rounds), tot_ms / std::max(1, st.rounds));
+    std::printf("{\"spec_tokens\":%zu,\"ms_per_token\":%.1f,\"tok_s\":%.2f,\"rounds\":%d,\"accepted\":%d,"
+                "\"accept_rate\":%.3f}\n", out.size(), ms / out.size(), out.size() * 1000.0 / ms, st.rounds,
+                st.accepted, st.rounds ? (double) st.accepted / st.rounds : 0.0);
+    std::printf("{\"generated\":[");
+    for (size_t i = 0; i < out.size(); ++i) std::printf("%s%d", i ? "," : "", out[i]);
+    std::printf("]}\n");
+    return 0;
+}
+
 int prefill_check(strata::core::GlmDsaModel& m, const std::vector<int32_t>& toks, int gen, int top_n) {
     const auto& g = m.geometry();
     std::string err;
@@ -364,7 +515,7 @@ int main(int argc, char** argv) {
     std::string model, tokens_arg, tokens_file, split;
     int64_t ctx = 4096;
     int dev = -1, gen = 0, top_n = 5;
-    bool eval = false, serve_mode = false, check = false, batched = false;
+    bool eval = false, serve_mode = false, check = false, batched = false, mtp_ev = false, spec_g = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const auto next = [&]() -> std::string {
@@ -385,6 +536,8 @@ int main(int argc, char** argv) {
         else if (a == "--serve") serve_mode = true;
         else if (a == "--prefill-check") check = true;
         else if (a == "--batched") batched = true;
+        else if (a == "--mtp-eval") mtp_ev = true;
+        else if (a == "--spec-gen") spec_g = true;
         else if (a == "--max-context") ctx = std::atoll(next().c_str());
         else if (a == "--layer-split") split = next();   // "0", "<layer>" or "auto": the layers across the GPUs
         else {
@@ -412,6 +565,8 @@ int main(int argc, char** argv) {
     }
     if (serve_mode) return serve(m);
     if (check) return prefill_check(m, toks, gen > 0 ? gen : 16, top_n);
+    if (mtp_ev) return mtp_eval(m, toks, gen);
+    if (spec_g) return spec_gen(m, toks, gen);
     const auto& g = m.geometry();
     std::fprintf(stderr, "glm-dsa: %d layers, n_embd %d, %d experts top-%d, device %d, ctx %lld\n", g.n_layers,
                  g.n_embd, g.n_expert, g.n_exp_used, m.device(), (long long) ctx);
