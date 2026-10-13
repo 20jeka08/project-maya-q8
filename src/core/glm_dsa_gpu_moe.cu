@@ -71,7 +71,7 @@ __global__ void add_into_kernel(float* __restrict__ y, const float* __restrict__
 /// One GPU's share of the experts: its streams, double buffer, MMQ context and row buffers.
 struct GmLane {
     int dev = 0;
-    bool main = false;              ///< the model's own device (its inputs and output are already there)
+    std::vector<float*> recv;       ///< the other lanes' sums, received on this device when it is the main lane
     cudaStream_t ks = nullptr;      ///< compute (the main lane: the legacy stream the batched path runs on)
     cudaStream_t cs = nullptr;      ///< copies
     cudaEvent_t ready[2] = {}, free_[2] = {};
@@ -88,7 +88,6 @@ struct GmState {
     std::vector<GmLane> lanes;
     int tmax = 0, group = 16;
     size_t stride = 0;
-    std::vector<float*> sums;       ///< every other lane's sum, brought to the main device
 };
 
 bool GlmDsaModel::gpu_moe_enabled() const {
@@ -110,11 +109,9 @@ void GlmDsaModel::gpu_moe_release() {
             if (L.free_[b]) cudaEventDestroy(L.free_[b]);
         }
         if (L.cs) cudaStreamDestroy(L.cs);
-            if (L.ks && !L.main) cudaStreamDestroy(L.ks);
+            if (L.ks) cudaStreamDestroy(L.ks);
         for (void* p : L.allocs) cudaFree(p);
     }
-    cudaSetDevice(dev_);
-    for (float* q : st->sums) cudaFree(q);
     delete st;
     gm_ = nullptr;
     cudaSetDevice(dev_);
@@ -149,7 +146,7 @@ bool GlmDsaModel::gpu_moe_alloc(int Tmax, std::string& err) {
         // the lanes: the model's device first, then the others (STRATA_GLM_GPU_LANES: "auto" or a device list)
         int n_dev = 0;
         cudaGetDeviceCount(&n_dev);
-        std::vector<int> devs = {dev_};
+        std::vector<int> devs = {dev_};   // (all of them: any can be the main lane of a layer split's part)
         const char* ls = std::getenv("STRATA_GLM_GPU_LANES");
         if (ls && std::string(ls) != "auto") {
             devs.clear();
@@ -165,7 +162,6 @@ bool GlmDsaModel::gpu_moe_alloc(int Tmax, std::string& err) {
         for (int d : devs) {
             GmLane L;
             L.dev = d;
-            L.main = d == dev_;
             st->lanes.push_back(L);
         }
     }
@@ -183,8 +179,7 @@ bool GlmDsaModel::gpu_moe_alloc(int Tmax, std::string& err) {
         if (!L.ctx) {
             L.ctx = new mmq::Context();
             GM_CUDA(cudaStreamCreateWithFlags(&L.cs, cudaStreamNonBlocking));
-            if (L.main) L.ks = nullptr;   // the legacy stream: ordered with the batched path's own work
-            else GM_CUDA(cudaStreamCreateWithFlags(&L.ks, cudaStreamNonBlocking));
+            GM_CUDA(cudaStreamCreateWithFlags(&L.ks, cudaStreamNonBlocking));
             for (int b = 0; b < 2; ++b) {
                 GM_CUDA(cudaEventCreateWithFlags(&L.ready[b], cudaEventDisableTiming));
                 GM_CUDA(cudaEventCreateWithFlags(&L.free_[b], cudaEventDisableTiming));
@@ -201,7 +196,7 @@ bool GlmDsaModel::gpu_moe_alloc(int Tmax, std::string& err) {
         ok = ok && (L.gu = (float*) alloc((size_t) rows * 2 * F * sizeof(float))) != nullptr;
         ok = ok && (L.h = (float*) alloc((size_t) rows * F * sizeof(float))) != nullptr;
         ok = ok && (L.dn = (float*) alloc((size_t) rows * E * sizeof(float))) != nullptr;
-        if (!L.main) {
+        {
             ok = ok && (L.x = (float*) alloc((size_t) Tmax * E * sizeof(float))) != nullptr;
             ok = ok && (L.rw = (float*) alloc((size_t) Tmax * g.n_exp_used * sizeof(float))) != nullptr;
             ok = ok && (L.out = (float*) alloc((size_t) Tmax * E * sizeof(float))) != nullptr;
@@ -214,12 +209,18 @@ bool GlmDsaModel::gpu_moe_alloc(int Tmax, std::string& err) {
         mmq::iota(L.iota, rows, L.ks);
         GM_CUDA(cudaStreamSynchronize(L.ks));
     }
-    GM_CUDA(cudaSetDevice(dev_));
-    // every other lane's sum comes to the main device (cudaMemcpyPeer: the driver routes it, no pinned buffer of
-    // ours - with the shards registered, a pinned buffer's copies failed "out of memory")
-    for (float* p : st->sums) cudaFree(p);
-    st->sums.assign(st->lanes.size() > 1 ? st->lanes.size() - 1 : 0, nullptr);
-    for (float*& p : st->sums) GM_CUDA(cudaMalloc(&p, (size_t) Tmax * E * sizeof(float)));
+    // every lane can be the main one (the device of the layer being computed): room there for the others' sums,
+    // which come by cudaMemcpyPeer (the driver routes it; with the shards registered, a pinned buffer's copies
+    // failed "out of memory")
+    for (GmLane& L : st->lanes) {
+        GM_CUDA(cudaSetDevice(L.dev));
+        L.recv.assign(st->lanes.size() - 1, nullptr);
+        for (float*& p : L.recv) {
+            GM_CUDA(cudaMalloc(&p, (size_t) Tmax * E * sizeof(float)));
+            L.allocs.push_back(p);
+        }
+    }
+    GM_CUDA(cudaSetDevice(cur_dev_));
     st->tmax = Tmax;
     std::string names;
     for (const GmLane& L : st->lanes) names += (names.empty() ? "" : ", ") + std::to_string(L.dev);
@@ -237,6 +238,10 @@ bool GlmDsaModel::moe_gpu_batch(int il, int T, const float* XN, const float* RW,
     const ExpertLayer& L = experts_[(size_t) il];
     const int K = g.n_exp_used, E = g.n_embd, F = g.n_ff_exp, NE = g.n_expert;
     const int n_lanes = (int) st->lanes.size();
+    const int main_dev = cur_dev_;   // the part being computed: its activations, weights and output are here
+    int main_li = 0;
+    for (int li = 0; li < n_lanes; ++li)
+        if (st->lanes[(size_t) li].dev == main_dev) main_li = li;
 
     // the shards' mappings registered once (read-only, portable), kept: the copies read the page cache directly.
     // Whole shards, not tensors - neighbouring tensors share pages, and a page cannot be registered twice.  The pages
@@ -296,12 +301,13 @@ bool GlmDsaModel::moe_gpu_batch(int il, int T, const float* XN, const float* RW,
         GmLane& ln = st->lanes[(size_t) li];
         GM_CUDA(cudaSetDevice(ln.dev));
         cudaStream_t s = ln.ks, cs = ln.cs;
-        const float* x = ln.main ? XN : ln.x;
-        const float* rw = ln.main ? RW : ln.rw;
-        float* out = ln.main ? out_dev : ln.out;
-        if (!ln.main) {   // the activations and the router weights from the main device
-            GM_CUDA(cudaMemcpyPeerAsync(ln.x, ln.dev, XN, dev_, (size_t) T * E * sizeof(float), s));
-            GM_CUDA(cudaMemcpyPeerAsync(ln.rw, ln.dev, RW, dev_, (size_t) T * K * sizeof(float), s));
+        const bool is_main = li == main_li;
+        const float* x = is_main ? XN : ln.x;
+        const float* rw = is_main ? RW : ln.rw;
+        float* out = is_main ? out_dev : ln.out;
+        if (!is_main) {   // the activations and the router weights from the main device
+            GM_CUDA(cudaMemcpyPeerAsync(ln.x, ln.dev, XN, main_dev, (size_t) T * E * sizeof(float), s));
+            GM_CUDA(cudaMemcpyPeerAsync(ln.rw, ln.dev, RW, main_dev, (size_t) T * K * sizeof(float), s));
         }
         GM_CUDA(cudaMemcpyAsync(ln.bounds, bounds.data(), bounds.size() * sizeof(int), cudaMemcpyHostToDevice, s));
         GM_CUDA(cudaMemcpyAsync(ln.row_tok, row_tok.data(), row_tok.size() * sizeof(int), cudaMemcpyHostToDevice, s));
@@ -376,8 +382,10 @@ bool GlmDsaModel::moe_gpu_batch(int il, int T, const float* XN, const float* RW,
         const unsigned n_blocks = (unsigned) ((n_out + 255) / 256);
         moe_combine_kernel<<<n_blocks, 256, 0, s>>>(ln.dn, rw, out, T, K, E);
         GM_CUDA(cudaGetLastError());
-        if (!ln.main)   // this lane's sum to the main device
-            GM_CUDA(cudaMemcpyPeerAsync(st->sums[(size_t) li - 1], dev_, out, ln.dev, (size_t) n_out * sizeof(float), s));
+        if (!is_main) {   // this lane's sum to the main device
+            float* dst = st->lanes[(size_t) main_li].recv[(size_t) (li < main_li ? li : li - 1)];
+            GM_CUDA(cudaMemcpyPeerAsync(dst, main_dev, out, ln.dev, (size_t) n_out * sizeof(float), s));
+        }
         GM_CUDA(cudaStreamSynchronize(s));
         return true;
     };
@@ -391,7 +399,7 @@ bool GlmDsaModel::moe_gpu_batch(int il, int T, const float* XN, const float* RW,
         for (auto& t : th) t.join();
         for (int li = 0; li < n_lanes; ++li) ok = ok && res[(size_t) li];
     }
-    GM_CUDA(cudaSetDevice(dev_));
+    GM_CUDA(cudaSetDevice(main_dev));
     if (!ok) {
         for (const auto& e : errs)
             if (!e.empty()) err = e;
@@ -399,8 +407,9 @@ bool GlmDsaModel::moe_gpu_batch(int il, int T, const float* XN, const float* RW,
     }
     // the other lanes' sums into the main lane's
     const int64_t n_out = (int64_t) T * E;
-    for (int li = 1; li < n_lanes; ++li) {
-        add_into_kernel<<<(unsigned) ((n_out + 255) / 256), 256>>>(out_dev, st->sums[(size_t) li - 1], n_out);
+    for (int k = 0; k + 1 < n_lanes; ++k) {
+        add_into_kernel<<<(unsigned) ((n_out + 255) / 256), 256>>>(out_dev, st->lanes[(size_t) main_li].recv[(size_t) k],
+                                                                     n_out);
         GM_CUDA(cudaGetLastError());
     }
     return true;

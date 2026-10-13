@@ -360,7 +360,7 @@ bool GlmDsaModel::decode_attend(const float* cache, int p, const float* q, float
 bool GlmDsaModel::prefill(const int32_t* toks, int64_t n, std::string& err, bool head,
                           const std::function<void(int64_t, int64_t)>& progress) {
     if (n <= 0) return true;
-    PF_CUDA(cudaSetDevice(dev_));
+    bind(0);
     if (!pf_alloc(err)) return false;
     if (pos_ + n > max_ctx_) {
         err = "glm-dsa: the prompt does not fit the context (" + std::to_string(pos_ + n) + " > " +
@@ -377,6 +377,7 @@ bool GlmDsaModel::prefill(const int32_t* toks, int64_t n, std::string& err, bool
 
 bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::string& err) {
     const GlmDsaGeometry& g = g_;
+    bind(0);
     const auto t_start = std::chrono::steady_clock::now();
     double cpu_ms = 0;
     cublasHandle_t cb = (cublasHandle_t) cublas_;
@@ -390,24 +391,29 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
         }
 
     // chunk activations
-    float* X = pf_;
-    float* XN = X + TE;
-    float* TMP = XN + TE;
-    float* MOE = TMP + TE;
-    float* SH = MOE + TE;
-    float* QR = SH + TE;
-    float* KV = QR + (size_t) T * g.q_lora;
-    float* Q = KV + (size_t) T * CR;
-    float* QA = Q + (size_t) T * H * QH;
-    float* O = QA + (size_t) T * H * KL;
-    float* GA = O + (size_t) T * H * g.v_head;
-    float* UP = GA + (size_t) T * g.n_ff_dense;
-    float* HH = UP + (size_t) T * g.n_ff_dense;
-    float* IQ = HH + (size_t) T * g.n_ff_dense;
-    float* IW = IQ + (size_t) T * g.idx_heads * g.idx_key;
-    float* RL = IW + (size_t) T * 64;
-    float* RW = RL + (size_t) T * g.n_expert;
-    int* IDS = (int*) (RW + (size_t) T * 64);
+    float *X, *XN, *TMP, *MOE, *SH, *QR, *KV, *Q, *QA, *O, *GA, *UP, *HH, *IQ, *IW, *RL, *RW;
+    int *IDS;
+    const auto carve = [&]() {
+        X = pf_;
+        XN = X + TE;
+        TMP = XN + TE;
+        MOE = TMP + TE;
+        SH = MOE + TE;
+        QR = SH + TE;
+        KV = QR + (size_t) T * g.q_lora;
+        Q = KV + (size_t) T * CR;
+        QA = Q + (size_t) T * H * QH;
+        O = QA + (size_t) T * H * KL;
+        GA = O + (size_t) T * H * g.v_head;
+        UP = GA + (size_t) T * g.n_ff_dense;
+        HH = UP + (size_t) T * g.n_ff_dense;
+        IQ = HH + (size_t) T * g.n_ff_dense;
+        IW = IQ + (size_t) T * g.idx_heads * g.idx_key;
+        RL = IW + (size_t) T * 64;
+        RW = RL + (size_t) T * g.n_expert;
+        IDS = (int*) (RW + (size_t) T * 64);
+    };
+    carve();
 
     // host buffers
     namespace kc = strata::kernels::cpu;
@@ -439,6 +445,19 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
     bool sparse = false;                      // the current selection is a mask (else: every visible cell)
 
     for (int il = 0; il < g.n_layers; ++il) {
+        if (part_of(il) != cur_) {   // the layer split: the chunk's residual to the next device, its selections too
+            const float* X_old = X;
+            PF_CUDA(cudaDeviceSynchronize());
+            bind(part_of(il));
+            if (!pf_alloc(err)) return false;
+            carve();
+            cb = (cublasHandle_t) cublas_;
+            if (!hand_over(X_old, X, T, err)) return false;
+            if (sparse) {
+                PF_CUDA(cudaMemcpy(d_sel_, h_sel_.data(), h_sel_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                PF_CUDA(cudaMemcpy(d_cnt_, h_cnt_.data(), h_cnt_.size() * sizeof(int), cudaMemcpyHostToDevice));
+            }
+        }
         // ---- attention inputs
         rms_rows_kernel<<<T, TB>>>(X, (const float*) W(il, "attn_norm.weight").d, XN, E, E, E, g.norm_eps);
         if (!gemm(W(il, "attn_q_a.weight"), XN, QR, T, err)) return false;

@@ -361,7 +361,7 @@ int prefill_check(strata::core::GlmDsaModel& m, const std::vector<int32_t>& toks
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, tokens_arg, tokens_file;
+    std::string model, tokens_arg, tokens_file, split;
     int64_t ctx = 4096;
     int dev = -1, gen = 0, top_n = 5;
     bool eval = false, serve_mode = false, check = false, batched = false;
@@ -386,8 +386,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-check") check = true;
         else if (a == "--batched") batched = true;
         else if (a == "--max-context") ctx = std::atoll(next().c_str());
-        else if (a == "--layer-split") (void) next();   // (Maya's server adds it for several GPUs: here every visible
-                                                         // GPU is a lane of the long-prompt experts instead)
+        else if (a == "--layer-split") split = next();   // "0", "<layer>" or "auto": the layers across the GPUs
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
             return 2;
@@ -407,7 +406,7 @@ int main(int argc, char** argv) {
 
     strata::core::GlmDsaModel m;
     std::string err;
-    if (!m.load(model, ctx, dev, err)) {
+    if (!m.load(model, ctx, dev, err, split)) {
         std::fprintf(stderr, "load failed: %s\n", err.c_str());
         return 1;
     }

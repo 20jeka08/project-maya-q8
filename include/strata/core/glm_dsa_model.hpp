@@ -91,8 +91,10 @@ public:
     GlmDsaModel& operator=(const GlmDsaModel&) = delete;
 
     /// Opens every shard of the split GGUF (`gguf_path` is any one of them), uploads the trunk's non-expert weights
-    /// to device `dev` (-1: the device with the most memory) and sizes the caches for `max_ctx` tokens.
-    bool load(const std::string& gguf_path, int64_t max_ctx, int dev, std::string& err);
+    /// and sizes the caches for `max_ctx` tokens.  `dev` (-1: the device with the most memory) takes the first
+    /// layers; `split`: "0" that device alone, "<layer>" the layers from <layer> on the next device, "auto" (or
+    /// empty) as many layers as fit on each visible device in turn (the largest first) - the layer split.
+    bool load(const std::string& gguf_path, int64_t max_ctx, int dev, std::string& err, const std::string& split = "");
 
     /// Appends one token at the next position.  The head runs when `logits` is non-null (its n_vocab floats are
     /// written there) or when `head` is set (the logits stay on the device for sample()); otherwise it is skipped -
@@ -126,11 +128,45 @@ public:
     int64_t pos() const { return pos_; }
     const GlmDsaGeometry& geometry() const { return g_; }
     int device() const { return dev_; }
+    /// The layer split: (device, first layer) of every part.
+    std::vector<std::pair<int, int>> parts() const {
+        std::vector<std::pair<int, int>> v;
+        for (const Part& p : parts_) v.push_back({p.dev, p.l0});
+        return v;
+    }
 
     /// Per-step timing (milliseconds, summed since the last call): the device part and the CPU expert part.
     void take_timing(double& dev_ms, double& cpu_ms, double& total_ms);
 
 private:
+    /// Everything one device holds for its layers [l0, l1) besides their weights and caches (which are per tensor /
+    /// per layer): its scratch, cuBLAS handle, decode graph stream, pinned words, batched-path buffers.  bind(i)
+    /// stashes the current part's pointers and loads part i's into the members below, so the per-layer code reads
+    /// the members as before.
+    struct Part {
+        int dev = 0, l0 = 0, l1 = 0;
+        float* sc = nullptr;
+        void* q8 = nullptr;
+        int* d_cells = nullptr;
+        float* kvg = nullptr;
+        float* ikv = nullptr;
+        void* cublas = nullptr;
+        float *pf = nullptr, *deq = nullptr, *att = nullptr, *pf_score = nullptr;
+        float *sg = nullptr, *ss = nullptr, *qc = nullptr;
+        int *d_sel = nullptr, *d_cnt = nullptr;
+        void* iq16 = nullptr;
+        void* gstream = nullptr;
+        float* pin = nullptr;
+        int* d_pos = nullptr;
+    };
+    std::vector<Part> parts_;
+    std::vector<int> layer_part_;
+    int cur_ = -1, cur_dev_ = 0;
+    void bind(int part);
+    int part_of(int il) const { return layer_part_[(size_t) il]; }
+    /// The residual (rows x n_embd floats at `x` in part `from`'s buffer) into part `to`'s buffer at `x_to`.
+    bool hand_over(const float* x_from, float* x_to, int64_t rows, std::string& err);
+
     struct DevW {   ///< one served weight: quantized rows (type != 0) or F32
         int type = 0;
         void* d = nullptr;
@@ -191,9 +227,8 @@ private:
     // device state
     // the attention cache in int8 (src/core/glm_dsa_kv.cuh): per layer int8 [max_ctx x cache_row] and FP16 scales
     // [max_ctx x cache_row/32]; the indexer's keys FP16 [max_ctx x idx_key] per FULL indexer layer
-    int8_t* kvq_ = nullptr;
-    void* kvs_ = nullptr;
-    void* ikeys_ = nullptr;
+    std::vector<int8_t*> kvq_l_;
+    std::vector<void*> kvs_l_, ik_l_;
     float* kvg_ = nullptr;        ///< up to top_k cache rows dequantized (decode past the small kernel; short prefill)
     std::vector<int64_t> ik_slot_;
     float* sc_ = nullptr;         ///< scratch arena
@@ -269,6 +304,8 @@ private:
     const float* moe_x_ = nullptr;  ///< moe_cpu's input / output when not h_x_ / h_moe_
     float* moe_y_ = nullptr;
     int prof_n_ = 0;
+    double diag_pos_ = 0, diag_sync_ = 0, diag_hand_ = 0;
+    int diag_n_ = 0;
 };
 
 }  // namespace strata::core

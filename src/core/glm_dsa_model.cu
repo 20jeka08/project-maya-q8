@@ -471,7 +471,8 @@ const GlmDsaModel::DevW& GlmDsaModel::W(int il, const char* suffix) const {
     return w_.at("blk." + std::to_string(il) + "." + suffix);
 }
 
-bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, std::string& err) {
+bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, std::string& err,
+                       const std::string& split) {
     // 1. the shards
     std::vector<std::string> paths;
     try {
@@ -490,27 +491,36 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
     const GlmDsaGeometry& g = g_;
     max_ctx_ = max_ctx;
 
-    // 2. the device: the one with the most memory unless asked
+    // 2. the devices: `dev` (else the one with the most memory) first, then the others by memory
     int n_dev = 0;
     GD_CHECK(cudaGetDeviceCount(&n_dev));
-    if (dev < 0) {
-        size_t best = 0;
+    // spin while waiting for a device, on every device, before any context exists: decode synchronises once
+    // per MoE layer, and with two contexts CUDA's automatic choice turned to blocking waits whose wake-up cost
+    // ~0.8 ms each on Windows - 77 -> ~140 ms of device time a token with the layers split over two cards.
+    // STRATA_GLM_SPIN=0 keeps the automatic choice.
+    if (!(std::getenv("STRATA_GLM_SPIN") && std::atoi(std::getenv("STRATA_GLM_SPIN")) == 0))
         for (int d = 0; d < n_dev; ++d) {
-            cudaDeviceProp pr{};
-            if (cudaGetDeviceProperties(&pr, d) == cudaSuccess && pr.totalGlobalMem > best) {
-                best = pr.totalGlobalMem;
-                dev = d;
-            }
+            cudaSetDevice(d);
+            cudaSetDeviceFlags(cudaDeviceScheduleSpin);
+            cudaGetLastError();   // (a context that already exists keeps its flags)
         }
+    std::vector<std::pair<size_t, int>> by_mem;
+    for (int d = 0; d < n_dev; ++d) {
+        cudaDeviceProp pr{};
+        if (cudaGetDeviceProperties(&pr, d) == cudaSuccess) by_mem.push_back({pr.totalGlobalMem, d});
     }
+    std::sort(by_mem.begin(), by_mem.end(), [](auto a, auto b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+    if (dev < 0) dev = by_mem.empty() ? -1 : by_mem[0].second;
     if (dev < 0 || dev >= n_dev) {
         err = "glm-dsa: no such CUDA device " + std::to_string(dev);
         return false;
     }
     dev_ = dev;
-    GD_CHECK(cudaSetDevice(dev_));
+    std::vector<int> devs = {dev};
+    for (const auto& bm : by_mem)
+        if (bm.second != dev) devs.push_back(bm.second);
 
-    // 3. the trunk's non-expert weights
+    // 3. what each layer costs on a device: its weights and its caches for max_ctx tokens
     const char* quant[] = {"attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "attn_output.weight",
                            "indexer.attn_q_b.weight", "indexer.attn_k.weight"};
     const char* f32[] = {"attn_norm.weight", "attn_q_a_norm.weight", "attn_kv_a_norm.weight", "ffn_norm.weight",
@@ -519,20 +529,118 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
     const char* dense[] = {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"};
     const char* shexp[] = {"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"};
     const char* router[] = {"ffn_gate_inp.weight", "exp_probs_b.bias"};
+    const auto tensor_bytes = [&](const std::string& name, bool quantized) -> size_t {
+        const strata::TensorInfo* t = find(name);
+        if (!t) return 0;
+        if (quantized && t->type != 0)
+            return ggml_row_size((ggml_type) t->type, (int64_t) t->shape[0]) * (size_t) (t->elements() / t->shape[0]);
+        return (size_t) t->elements() * sizeof(float);
+    };
+    const size_t kv_row = (size_t) g.cache_row() + (size_t) (g.cache_row() / kv::kBlock) * sizeof(__half);
+    std::vector<size_t> layer_bytes((size_t) g.n_layers, 0);
     for (int il = 0; il < g.n_layers; ++il) {
         const std::string L = "blk." + std::to_string(il) + ".";
-        for (const char* s : quant)
-            if (!upload(L + s, true, err)) return false;
-        for (const char* s : f32)
-            if (!upload(L + s, false, err)) return false;
+        size_t b = 0;
+        for (const char* t : quant) b += tensor_bytes(L + t, true);
+        for (const char* t : f32) b += tensor_bytes(L + t, false);
+        if (il < g.dense_lead)
+            for (const char* t : dense) b += tensor_bytes(L + t, true);
+        else {
+            for (const char* t : shexp) b += tensor_bytes(L + t, true);
+            for (const char* t : router) b += tensor_bytes(L + t, false);
+        }
+        b += (size_t) max_ctx * kv_row;
+        if (g.indexer_full[(size_t) il]) b += (size_t) max_ctx * g.idx_key * sizeof(__half);
+        layer_bytes[(size_t) il] = b;
+    }
+    const size_t head_bytes = tensor_bytes("output.weight", true) + tensor_bytes("output_norm.weight", false);
+    // per device, beside its layers: the batched path's scratch, the long-prompt expert lane, cuBLAS, graphs
+    double reserve_gb = 5.0;
+    if (const char* r = std::getenv("STRATA_GLM_RESERVE_GB")) reserve_gb = std::atof(r);
+    const size_t reserve = (size_t) (reserve_gb * 1e9);
+
+    // the split: "0" one device, "<layer>" two parts, "auto"/"" as many layers as fit on each device in turn
+    std::string sp = split;
+    if (const char* e = std::getenv("STRATA_GLM_SPLIT")) sp = e;
+    std::vector<int> starts = {0};
+    if (sp == "0") {
+        devs.resize(1);
+    } else if (!sp.empty() && sp != "auto") {
+        const int at = std::atoi(sp.c_str());
+        if (at <= 0 || at >= g.n_layers || devs.size() < 2) {
+            err = "glm-dsa: --layer-split " + sp + " needs a layer in 1.." + std::to_string(g.n_layers - 1) + " and two devices";
+            return false;
+        }
+        starts.push_back(at);
+        devs.resize(2);
+    } else {
+        int il = 0;
+        for (size_t di = 0; di < devs.size() && il < g.n_layers; ++di) {
+            size_t fr = 0, tot = 0;
+            GD_CHECK(cudaSetDevice(devs[di]));
+            GD_CHECK(cudaMemGetInfo(&fr, &tot));
+            const size_t room = fr > reserve ? fr - reserve : 0;
+            size_t used = 0;
+            const int first = il;
+            while (il < g.n_layers) {
+                const size_t need = layer_bytes[(size_t) il] + (il + 1 == g.n_layers ? head_bytes : 0);
+                if (used + need > room) break;
+                used += need;
+                ++il;
+            }
+            if (il == g.n_layers) {
+                devs.resize(di + 1);
+                break;
+            }
+            if (di + 1 < devs.size()) {
+                if (il == first) {
+                    err = "glm-dsa: device " + std::to_string(devs[di]) + " cannot hold even one layer";
+                    return false;
+                }
+                starts.push_back(il);
+            }
+        }
+        if (il < g.n_layers) {
+            double need = 0;
+            for (int l = il; l < g.n_layers; ++l) need += layer_bytes[(size_t) l] / 1e9;
+            err = "glm-dsa: " + std::to_string((long long) max_ctx) + " tokens of context do not fit the GPUs (" +
+                  std::to_string(need) + " GB more needed) - a smaller --ctx / --max-context";
+            return false;
+        }
+    }
+    parts_.clear();
+    layer_part_.assign((size_t) g.n_layers, 0);
+    for (size_t pi = 0; pi < starts.size(); ++pi) {
+        Part p;
+        p.dev = devs[pi];
+        p.l0 = starts[pi];
+        p.l1 = pi + 1 < starts.size() ? starts[pi + 1] : g.n_layers;
+        for (int il = p.l0; il < p.l1; ++il) layer_part_[(size_t) il] = (int) pi;
+        parts_.push_back(p);
+    }
+    for (const Part& p : parts_) {
+        double gb = 0;
+        for (int il = p.l0; il < p.l1; ++il) gb += layer_bytes[(size_t) il] / 1e9;
+        std::fprintf(stderr, "glm-dsa: device %d holds layers %d-%d (%.1f GB with their caches for %lld tokens)\n",
+                     p.dev, p.l0, p.l1 - 1, gb, (long long) max_ctx);
+    }
+
+    // 4. the trunk's non-expert weights, each layer's on its part's device; the head on the last part's
+    for (int il = 0; il < g.n_layers; ++il) {
+        GD_CHECK(cudaSetDevice(parts_[(size_t) part_of(il)].dev));
+        const std::string L = "blk." + std::to_string(il) + ".";
+        for (const char* t : quant)
+            if (!upload(L + t, true, err)) return false;
+        for (const char* t : f32)
+            if (!upload(L + t, false, err)) return false;
         if (il < g.dense_lead) {
-            for (const char* s : dense)
-                if (!upload(L + s, true, err)) return false;
+            for (const char* t : dense)
+                if (!upload(L + t, true, err)) return false;
         } else {
-            for (const char* s : shexp)
-                if (!upload(L + s, true, err)) return false;
-            for (const char* s : router)
-                if (!upload(L + s, false, err)) return false;
+            for (const char* t : shexp)
+                if (!upload(L + t, true, err)) return false;
+            for (const char* t : router)
+                if (!upload(L + t, false, err)) return false;
         }
         if ((il + 1) % 10 == 0 || il + 1 == g.n_layers) {
             std::fprintf(stderr, "glm-dsa: layer %d/%d uploaded\r", il + 1, g.n_layers);
@@ -540,6 +648,7 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
         }
     }
     std::fprintf(stderr, "\n");
+    GD_CHECK(cudaSetDevice(parts_.back().dev));
     if (!upload("output_norm.weight", false, err) || !upload("output.weight", true, err)) return false;
     tok_embd_ = find("token_embd.weight", &tok_embd_file_);
     if (!tok_embd_ || !ggml_get_type_traits((ggml_type) tok_embd_->type)->to_float) {
@@ -584,35 +693,59 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
         e.d_expert = f->d_row * (size_t) g.n_embd;
     }
 
-    // 5. the caches and the scratch
-    // the attention cache in int8 (glm_dsa_kv.cuh): 612 bytes a token a layer instead of 2304
-    const size_t cells = (size_t) g.n_layers * (size_t) max_ctx;
-    GD_CHECK(cudaMalloc(&kvq_, cells * (size_t) g.cache_row()));
-    allocs_.push_back(kvq_);
-    GD_CHECK(cudaMalloc(&kvs_, cells * (size_t) (g.cache_row() / kv::kBlock) * sizeof(__half)));
-    allocs_.push_back(kvs_);
-    GD_CHECK(cudaMalloc(&kvg_, (size_t) std::max(g.idx_top_k, 1) * g.cache_row() * sizeof(float)));
-    allocs_.push_back(kvg_);
+    // 5. the caches and the scratch, per part
     ik_slot_.assign((size_t) g.n_layers, -1);
     int64_t n_full = 0;
     for (int il = 0; il < g.n_layers; ++il)
         if (g.indexer_full[(size_t) il]) ik_slot_[(size_t) il] = n_full++;
-    GD_CHECK(cudaMalloc(&ikeys_, std::max<size_t>(1, (size_t) n_full * (size_t) max_ctx * (size_t) g.idx_key) * sizeof(__half)));
-    allocs_.push_back(ikeys_);
+    kvq_l_.assign((size_t) g.n_layers, nullptr);
+    kvs_l_.assign((size_t) g.n_layers, nullptr);
+    ik_l_.assign((size_t) g.n_layers, nullptr);
     const size_t scratch = (size_t) 16 * g.n_embd + (size_t) 4 * g.n_head * g.qk_head() +
                            (size_t) 2 * g.n_head * g.kv_lora + (size_t) 4 * g.n_ff_dense +
                            (size_t) g.idx_heads * g.idx_key + (size_t) max_ctx + (size_t) g.n_vocab + 4096;
-    GD_CHECK(cudaMalloc(&sc_, scratch * sizeof(float)));
-    allocs_.push_back(sc_);
     const int max_in = std::max({g.n_embd, g.n_head * g.v_head, g.n_ff_dense, g.q_lora, g.n_ff_exp});
-    GD_CHECK(cudaMalloc(&q8_, strata::kernels::native_q8_1_bytes(max_in)));
-    allocs_.push_back(q8_);
-    GD_CHECK(cudaMalloc(&d_cells_, (size_t) g.idx_top_k * sizeof(int)));
-    allocs_.push_back(d_cells_);
+    for (Part& p : parts_) {
+        GD_CHECK(cudaSetDevice(p.dev));
+        // the attention cache in int8 (glm_dsa_kv.cuh): 612 bytes a token a layer instead of 2304; the indexer keys FP16
+        const size_t n_l = (size_t) (p.l1 - p.l0);
+        int8_t* q = nullptr;
+        __half* sc = nullptr;
+        GD_CHECK(cudaMalloc(&q, n_l * (size_t) max_ctx * g.cache_row()));
+        allocs_.push_back(q);
+        GD_CHECK(cudaMalloc(&sc, n_l * (size_t) max_ctx * (g.cache_row() / kv::kBlock) * sizeof(__half)));
+        allocs_.push_back(sc);
+        int n_fl = 0;
+        for (int il = p.l0; il < p.l1; ++il) n_fl += g.indexer_full[(size_t) il] ? 1 : 0;
+        __half* ik = nullptr;
+        GD_CHECK(cudaMalloc(&ik, std::max<size_t>(1, (size_t) n_fl * (size_t) max_ctx * g.idx_key) * sizeof(__half)));
+        allocs_.push_back(ik);
+        int fi = 0;
+        for (int il = p.l0; il < p.l1; ++il) {
+            const size_t k = (size_t) (il - p.l0);
+            kvq_l_[(size_t) il] = q + k * (size_t) max_ctx * g.cache_row();
+            kvs_l_[(size_t) il] = sc + k * (size_t) max_ctx * (g.cache_row() / kv::kBlock);
+            if (g.indexer_full[(size_t) il]) ik_l_[(size_t) il] = ik + (size_t) (fi++) * (size_t) max_ctx * g.idx_key;
+        }
+        GD_CHECK(cudaMalloc(&p.kvg, (size_t) std::max(g.idx_top_k, 1) * g.cache_row() * sizeof(float)));
+        allocs_.push_back(p.kvg);
+        GD_CHECK(cudaMalloc(&p.ikv, (size_t) g.idx_key * sizeof(float)));
+        allocs_.push_back(p.ikv);
+        GD_CHECK(cudaMalloc(&p.sc, scratch * sizeof(float)));
+        allocs_.push_back(p.sc);
+        GD_CHECK(cudaMalloc(&p.q8, strata::kernels::native_q8_1_bytes(max_in)));
+        allocs_.push_back(p.q8);
+        GD_CHECK(cudaMalloc(&p.d_cells, (size_t) g.idx_top_k * sizeof(int)));
+        allocs_.push_back(p.d_cells);
+    }
+    // the head's buffers on the last part
+    GD_CHECK(cudaSetDevice(parts_.back().dev));
     GD_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
     allocs_.push_back(d_tok_);
     GD_CHECK(cudaMalloc(&d_logits_buf_, (size_t) g.n_vocab * sizeof(float)));
     allocs_.push_back(d_logits_buf_);
+    cur_ = -1;
+    for (int i = (int) parts_.size() - 1; i >= 0; --i) bind(i);   // (every part's members loaded once, then part 0)
 
     int threads = (int) std::thread::hardware_concurrency() / 2;
     if (const char* s = std::getenv("STRATA_GLM_THREADS")) threads = std::atoi(s);
@@ -747,7 +880,7 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
                                !(std::getenv("STRATA_GLM_PROFILE") && std::atoi(std::getenv("STRATA_GLM_PROFILE"))) &&
                                !(std::getenv("STRATA_GLM_F32_GEMV") && std::atoi(std::getenv("STRATA_GLM_F32_GEMV")));
     if (graphs && !capture_) return step_graph(token, logits, err, head);
-    GD_CHECK(cudaSetDevice(dev_));
+    bind(0);
     const auto t0 = std::chrono::steady_clock::now();
     double cpu_ms = 0;
     const int p = (int) pos_;
@@ -769,26 +902,31 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
     };
 
     // scratch carve-up
-    float* x = sc_;
-    float* xn = x + g.n_embd;
-    float* tmp = xn + g.n_embd;
-    float* moe = tmp + g.n_embd;
-    float* sh = moe + g.n_embd;
-    float* router = sh + g.n_embd;   // n_expert (< 4 * n_embd)
-    float* rw = router + 4 * g.n_embd;
-    int* ids = (int*) (rw + 64);
-    float* qr = (float*) (ids + 64);
-    float* kvpe = qr + g.q_lora;
-    float* q = kvpe + g.cache_row();
-    float* qabs = q + (size_t) g.n_head * g.qk_head();
-    float* o = qabs + (size_t) g.n_head * g.kv_lora;
-    float* gate = o + (size_t) g.n_head * g.v_head;
-    float* up = gate + g.n_ff_dense;
-    float* hh = up + g.n_ff_dense;
-    float* iq = hh + g.n_ff_dense;
-    float* iw = iq + (size_t) g.idx_heads * g.idx_key;
-    float* score = iw + 64;
-    float* d_logits = d_logits_buf_;
+    float *x, *xn, *tmp, *moe, *sh, *router, *rw, *qr, *kvpe, *q, *qabs, *o, *gate, *up, *hh, *iq, *iw, *score, *d_logits;
+    int *ids;
+    const auto carve = [&]() {
+        x = sc_;
+        xn = x + g.n_embd;
+        tmp = xn + g.n_embd;
+        moe = tmp + g.n_embd;
+        sh = moe + g.n_embd;
+        router = sh + g.n_embd;
+        rw = router + 4 * g.n_embd;
+        ids = (int*) (rw + 64);
+        qr = (float*) (ids + 64);
+        kvpe = qr + g.q_lora;
+        q = kvpe + g.cache_row();
+        qabs = q + (size_t) g.n_head * g.qk_head();
+        o = qabs + (size_t) g.n_head * g.kv_lora;
+        gate = o + (size_t) g.n_head * g.v_head;
+        up = gate + g.n_ff_dense;
+        hh = up + g.n_ff_dense;
+        iq = hh + g.n_ff_dense;
+        iw = iq + (size_t) g.idx_heads * g.idx_key;
+        score = iw + 64;
+        d_logits = d_logits_buf_;
+    };
+    carve();
 
     // the embedding row, dequantized on the host from the mmap
     {
@@ -806,6 +944,15 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
 
     prof(7);
     for (int il = 0; il < g.n_layers; ++il) {
+        if (part_of(il) != cur_) {   // the layer split: the residual to the next device, its selection too
+            const float* x_old = x;
+            GD_CHECK(cudaDeviceSynchronize());
+            bind(part_of(il));
+            carve();
+            if (!hand_over(x_old, x, 1, err)) return false;
+            if (sparse)
+                GD_CHECK(cudaMemcpy(d_cells_, cells_.data(), cells_.size() * sizeof(int), cudaMemcpyHostToDevice));
+        }
         // ---- attention
         rms_norm_kernel<<<1, T_>>>(x, (const float*) W(il, "attn_norm.weight").d, xn, g.n_embd, g.norm_eps);
         if (!gemv(W(il, "attn_q_a.weight"), xn, qr, err)) return false;
@@ -919,12 +1066,35 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
     return true;
 }
 
-int8_t* GlmDsaModel::kv_q(int il) const { return kvq_ + (size_t) il * (size_t) max_ctx_ * g_.cache_row(); }
-void* GlmDsaModel::kv_s(int il) const {
-    return (__half*) kvs_ + (size_t) il * (size_t) max_ctx_ * (g_.cache_row() / kv::kBlock);
+int8_t* GlmDsaModel::kv_q(int il) const { return kvq_l_[(size_t) il]; }
+void* GlmDsaModel::kv_s(int il) const { return kvs_l_[(size_t) il]; }
+void* GlmDsaModel::ik_keys(int il) const { return ik_l_[(size_t) il]; }
+
+void GlmDsaModel::bind(int i) {
+    if (i == cur_) {
+        cudaSetDevice(cur_dev_);
+        return;
+    }
+    if (cur_ >= 0) {   // stash what the current part allocated since it was bound
+        Part& o = parts_[(size_t) cur_];
+        o.sc = sc_, o.q8 = q8_, o.d_cells = d_cells_, o.kvg = kvg_, o.ikv = ikv_, o.cublas = cublas_;
+        o.pf = pf_, o.deq = deq_, o.att = att_, o.pf_score = pf_score_, o.sg = sg_, o.ss = ss_, o.qc = qc_;
+        o.d_sel = d_sel_, o.d_cnt = d_cnt_, o.iq16 = iq16_, o.gstream = gstream_, o.pin = pin_, o.d_pos = d_pos_;
+    }
+    const Part& p = parts_[(size_t) i];
+    sc_ = p.sc, q8_ = p.q8, d_cells_ = p.d_cells, kvg_ = p.kvg, ikv_ = p.ikv, cublas_ = p.cublas;
+    pf_ = p.pf, deq_ = p.deq, att_ = p.att, pf_score_ = p.pf_score, sg_ = p.sg, ss_ = p.ss, qc_ = p.qc;
+    d_sel_ = p.d_sel, d_cnt_ = p.d_cnt, iq16_ = p.iq16, gstream_ = p.gstream, pin_ = p.pin, d_pos_ = p.d_pos;
+    cur_ = i;
+    cur_dev_ = p.dev;
+    cudaSetDevice(cur_dev_);
 }
-void* GlmDsaModel::ik_keys(int il) const {
-    return (__half*) ikeys_ + (size_t) ik_slot_[(size_t) il] * (size_t) max_ctx_ * g_.idx_key;
+
+/// The residual into the next part: everything queued on the old device finishes, then a peer copy (the driver
+/// routes it through the host when the cards have no peer access).
+bool GlmDsaModel::hand_over(const float* x_from, float* x_to, int64_t rows, std::string& err) {
+    (void) err;
+    return cudaMemcpy(x_to, x_from, (size_t) rows * g_.n_embd * sizeof(float), cudaMemcpyDefault) == cudaSuccess;
 }
 
 /// The indexer's selection for one decode token: its scores over the n_vis cached keys, the top_k of them chosen on
@@ -970,7 +1140,7 @@ bool GlmDsaModel::read_logits(float* out, std::string& err) {
         err = "glm-dsa: no head has run";
         return false;
     }
-    GD_CHECK(cudaSetDevice(dev_));
+    GD_CHECK(cudaSetDevice(parts_.back().dev));
     GD_CHECK(cudaMemcpy(out, d_logits_, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost));
     return true;
 }
@@ -980,7 +1150,7 @@ int GlmDsaModel::sample(const strata::kernels::SamplerParams& sp, std::string& e
         err = "glm-dsa: sample() before any head ran";
         return -1;
     }
-    if (cudaSetDevice(dev_) != cudaSuccess) {
+    if (cudaSetDevice(parts_.back().dev) != cudaSuccess) {
         err = "glm-dsa: cudaSetDevice failed";
         return -1;
     }
@@ -1030,37 +1200,46 @@ bool GlmDsaModel::gemv_s(const DevW& w, const float* x, float* y, void* stream, 
 
 bool GlmDsaModel::build_graphs(std::string& err) {
     const GlmDsaGeometry& g = g_;
-    cudaStream_t s = nullptr;
-    GD_CHECK(cudaStreamCreate(&s));
-    gstream_ = s;
-    GD_CHECK(cudaHostAlloc((void**) &pin_, (size_t) (128 + 3 * g.n_embd + 64) * sizeof(float), cudaHostAllocDefault));
-    GD_CHECK(cudaMalloc(&d_pos_, sizeof(int)));
-    allocs_.push_back(d_pos_);
-    GD_CHECK(cudaMalloc(&ikv_, (size_t) g.idx_key * sizeof(float)));
-    allocs_.push_back(ikv_);
+    // every part: a stream, pinned words and the device position of its own
+    for (int pi = 0; pi < (int) parts_.size(); ++pi) {
+        bind(pi);
+        cudaStream_t ps = nullptr;
+        GD_CHECK(cudaStreamCreate(&ps));
+        gstream_ = ps;
+        GD_CHECK(cudaHostAlloc((void**) &pin_, (size_t) (128 + 3 * g.n_embd + 64) * sizeof(float), cudaHostAllocPortable));
+        GD_CHECK(cudaMalloc(&d_pos_, sizeof(int)));
+        allocs_.push_back(d_pos_);
+    }
+    bind(0);
+    cudaStream_t s = (cudaStream_t) gstream_;
 
     // the step path's scratch carve-up (the same buffers, so the two paths are interchangeable mid-sequence)
-    float* x = sc_;
-    float* xn = x + g.n_embd;
-    float* tmp = xn + g.n_embd;
-    float* moe = tmp + g.n_embd;
-    float* sh = moe + g.n_embd;
-    float* router = sh + g.n_embd;
-    float* rw = router + 4 * g.n_embd;
-    int* ids = (int*) (rw + 64);
-    float* qr = (float*) (ids + 64);
-    float* kvpe = qr + g.q_lora;
-    float* q = kvpe + g.cache_row();
-    float* qabs = q + (size_t) g.n_head * g.qk_head();
-    float* o = qabs + (size_t) g.n_head * g.kv_lora;
-    float* gate = o + (size_t) g.n_head * g.v_head;
-    float* up = gate + g.n_ff_dense;
-    float* hh = up + g.n_ff_dense;
-    float* iq = hh + g.n_ff_dense;
-    float* iw = iq + (size_t) g.idx_heads * g.idx_key;
-    float* h_rwids = pin_;               // rw (64) then ids (64): rw and ids sit back to back on the device too
-    float* h_x = pin_ + 128;
-    float* h_moe = h_x + g.n_embd;
+    float *x, *xn, *tmp, *moe, *sh, *router, *rw, *qr, *kvpe, *q, *qabs, *o, *gate, *up, *hh, *iq, *iw, *h_rwids, *h_x, *h_moe;
+    int *ids;
+    const auto carve = [&]() {
+        x = sc_;
+        xn = x + g.n_embd;
+        tmp = xn + g.n_embd;
+        moe = tmp + g.n_embd;
+        sh = moe + g.n_embd;
+        router = sh + g.n_embd;
+        rw = router + 4 * g.n_embd;
+        ids = (int*) (rw + 64);
+        qr = (float*) (ids + 64);
+        kvpe = qr + g.q_lora;
+        q = kvpe + g.cache_row();
+        qabs = q + (size_t) g.n_head * g.qk_head();
+        o = qabs + (size_t) g.n_head * g.kv_lora;
+        gate = o + (size_t) g.n_head * g.v_head;
+        up = gate + g.n_ff_dense;
+        hh = up + g.n_ff_dense;
+        iq = hh + g.n_ff_dense;
+        iw = iq + (size_t) g.idx_heads * g.idx_key;
+        h_rwids = pin_;
+        h_x = pin_ + 128;
+        h_moe = h_x + g.n_embd;
+    };
+    carve();
 
     const float theta_scale = std::pow(g.rope_base, -2.0f / (float) g.qk_rope);
     const auto record = [&](void*& out, const std::function<bool()>& body) -> bool {
@@ -1085,6 +1264,11 @@ bool GlmDsaModel::build_graphs(std::string& err) {
     gS_.assign((size_t) g.n_layers, nullptr);
     gC_.assign((size_t) g.n_layers, nullptr);
     for (int il = 0; il < g.n_layers; ++il) {
+        if (part_of(il) != cur_) {   // the layer split: this layer's part, its stream and buffers
+            bind(part_of(il));
+            carve();
+            s = (cudaStream_t) gstream_;
+        }
         const bool full = g.indexer_full[(size_t) il];
         if (!record(gA_[(size_t) il], [&]() -> bool {
                 rms_norm_kernel<<<1, T_, 0, s>>>(x, (const float*) W(il, "attn_norm.weight").d, xn, g.n_embd,
@@ -1167,13 +1351,14 @@ bool GlmDsaModel::build_graphs(std::string& err) {
 
 bool GlmDsaModel::step_graph(int32_t token, float* logits, std::string& err, bool head) {
     const GlmDsaGeometry& g = g_;
-    GD_CHECK(cudaSetDevice(dev_));
+    bind(0);
     if (!gstream_) {
         const auto b0 = std::chrono::steady_clock::now();
         if (!build_graphs(err)) return false;
         std::fprintf(stderr, "glm-dsa: decode graphs recorded (%d layers) in %.0f ms\n", g.n_layers,
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0).count());
     }
+    bind(0);
     cudaStream_t s = (cudaStream_t) gstream_;
     const auto t0 = std::chrono::steady_clock::now();
     double cpu_ms = 0;
@@ -1182,35 +1367,51 @@ bool GlmDsaModel::step_graph(int32_t token, float* logits, std::string& err, boo
     static const int blas_min = std::getenv("STRATA_GLM_BLAS_MIN") ? std::atoi(std::getenv("STRATA_GLM_BLAS_MIN")) : 1024;
     const bool dec_blas = blas_on && p + 1 > blas_min;
 
-    float* x = sc_;
-    float* xn = x + g.n_embd;
-    float* router = xn + 4 * g.n_embd;   // (tmp, moe, sh, router) - only `score` below is used here
-    float* rw = router + 4 * g.n_embd;
-    int* ids = (int*) (rw + 64);
-    float* qr = (float*) (ids + 64);
-    float* kvpe = qr + g.q_lora;
-    float* q = kvpe + g.cache_row();
-    float* qabs = q + (size_t) g.n_head * g.qk_head();
-    float* o = qabs + (size_t) g.n_head * g.kv_lora;
-    float* gate = o + (size_t) g.n_head * g.v_head;
-    float* iq = gate + 3 * (size_t) g.n_ff_dense;
-    float* iw = iq + (size_t) g.idx_heads * g.idx_key;
-    float* score = iw + 64;
-    const float* h_rw = pin_;
-    const int* h_ids = (const int*) (pin_ + 64);
-    float* h_x = pin_ + 128;
-    float* h_moe = h_x + g.n_embd;
-    float* h_emb = h_moe + g.n_embd;
-    int* h_pos = (int*) (h_emb + g.n_embd);
+    float *x, *xn, *router, *rw, *qr, *kvpe, *q, *qabs, *o, *gate, *iq, *iw, *score, *h_x, *h_moe, *h_emb;
+    int *ids, *h_pos;
+    const float *h_rw;
+    const int *h_ids;
+    const auto carve = [&]() {
+        x = sc_;
+        xn = x + g.n_embd;
+        router = xn + 4 * g.n_embd;
+        rw = router + 4 * g.n_embd;
+        ids = (int*) (rw + 64);
+        qr = (float*) (ids + 64);
+        kvpe = qr + g.q_lora;
+        q = kvpe + g.cache_row();
+        qabs = q + (size_t) g.n_head * g.qk_head();
+        o = qabs + (size_t) g.n_head * g.kv_lora;
+        gate = o + (size_t) g.n_head * g.v_head;
+        iq = gate + 3 * (size_t) g.n_ff_dense;
+        iw = iq + (size_t) g.idx_heads * g.idx_key;
+        score = iw + 64;
+        h_rw = pin_;
+        h_ids = (const int*) (pin_ + 64);
+        h_x = pin_ + 128;
+        h_moe = h_x + g.n_embd;
+        h_emb = h_moe + g.n_embd;
+        h_pos = (int*) (h_emb + g.n_embd);
+    };
+    carve();
 
     // the embedding row and the position
     {
         const size_t row = ggml_row_size((ggml_type) tok_embd_->type, g.n_embd);
         ggml_get_type_traits((ggml_type) tok_embd_->type)
             ->to_float(tok_embd_file_->tensor_data(*tok_embd_) + row * (size_t) token, h_emb, g.n_embd);
-        *h_pos = p;
+        // the position on every part's device (the graphs read it there)
+        const auto dg0 = std::chrono::steady_clock::now();
+        for (int pi = (int) parts_.size() - 1; pi >= 0; --pi) {
+            bind(pi);
+            carve();
+            *h_pos = p;
+            GD_CHECK(cudaMemcpyAsync(d_pos_, h_pos, sizeof(int), cudaMemcpyHostToDevice, (cudaStream_t) gstream_));
+        }
+        diag_pos_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dg0).count();
+        ggml_get_type_traits((ggml_type) tok_embd_->type)
+            ->to_float(tok_embd_file_->tensor_data(*tok_embd_) + row * (size_t) token, h_emb, g.n_embd);
         GD_CHECK(cudaMemcpyAsync(x, h_emb, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, s));
-        GD_CHECK(cudaMemcpyAsync(d_pos_, h_pos, sizeof(int), cudaMemcpyHostToDevice, s));
     }
     const float kq_scale = 1.0f / std::sqrt((float) g.qk_head());
     const int n_vis = p + 1;
@@ -1220,6 +1421,20 @@ bool GlmDsaModel::step_graph(int32_t token, float* logits, std::string& err, boo
     std::vector<float> v_rw((size_t) g.n_exp_used);
 
     for (int il = 0; il < g.n_layers; ++il) {
+        if (part_of(il) != cur_) {   // the layer split: the residual to the next device, its selection too
+            const float* x_old = x;
+            const auto ds0 = std::chrono::steady_clock::now();
+            GD_CHECK(cudaStreamSynchronize(s));
+            diag_sync_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ds0).count();
+            bind(part_of(il));
+            carve();
+            s = (cudaStream_t) gstream_;
+            const auto dh0 = std::chrono::steady_clock::now();
+            if (!hand_over(x_old, x, 1, err)) return false;
+            diag_hand_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dh0).count();
+            if (sparse)
+                GD_CHECK(cudaMemcpy(d_cells_, cells_.data(), cells_.size() * sizeof(int), cudaMemcpyHostToDevice));
+        }
         GD_CHECK(cudaGraphLaunch((cudaGraphExec_t) gA_[(size_t) il], s));
         if (g.indexer_full[(size_t) il]) {
             if (n_vis > g.idx_top_k) {
@@ -1266,6 +1481,8 @@ bool GlmDsaModel::step_graph(int32_t token, float* logits, std::string& err, boo
     }
     GD_CHECK(cudaStreamSynchronize(s));
     ++pos_;
+    if (std::getenv("STRATA_GLM_SPLIT_DIAG") && ++diag_n_ % 8 == 0)
+        std::fprintf(stderr, "split diag: pos upload %.2f ms, boundary sync %.2f ms, hand-over %.2f ms (per token)%c", diag_pos_ / diag_n_, diag_sync_ / diag_n_, diag_hand_ / diag_n_, 10);
     const double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     t_total_ += total;
     t_cpu_ += cpu_ms;
