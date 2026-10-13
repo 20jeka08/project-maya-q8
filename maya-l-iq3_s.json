@@ -1,0 +1,50 @@
+{
+ "exe": "E:\\progs\\Maya\\project-maya\\build\\strata.exe",
+ "args": [
+  "--glm-pack",
+  "E:\\progs\\Maya-data\\models\\Maya-L\\pack",
+  "--max-context",
+  "393216",
+  "--kv",
+  "int8",
+  "--prefill",
+  "auto"
+ ],
+ "env": {
+  "STRATA_GLM_RAM_GB": "320",
+  "STRATA_GLM_RAM_RESIDENT": "1",
+  "STRATA_GLM_RAM_SLACK": "2",
+  "STRATA_GLM_PROMOTE_MIN": "6",
+  "STRATA_GLM_RESERVE_MB": "2048"
+ },
+ "cwd": "E:\\progs\\Maya\\project-maya",
+ "tokenizer": "E:\\progs\\Maya-data\\models\\Maya-L\\pack\\tokenizer",
+ "model_name": "glm-5.3-flash",
+ "gpu": [
+  1,
+  0
+ ],
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95
+ },
+ "reasoning_effort": "high",
+ "lib_dirs": [
+  "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\bin"
+ ],
+ "port": 8080,
+ "vision": {
+  "exe": "E:\\progs\\Maya\\project-maya\\build-vision\\bin\\strata-vision.exe",
+  "mmproj": "E:\\progs\\Maya-data\\models\\Maya-L\\vision\\mmproj-GLM-5.3-Flash-F16.gguf",
+  "model": "E:\\progs\\Maya-data\\models\\Maya-L\\vision\\GLM-5.3-Flash-vocab.gguf",
+  "gpu": true
+ },
+ "log": "E:\\progs\\Maya\\project-maya\\maya-l-iq3_s.log",
+ "installer": {
+  "models_dir": "E:\\progs\\Maya-data\\models",
+  "quant": "IQ3_S",
+  "gguf": "E:\\progs\\Maya-data\\models\\Maya-L\\GLM-5.3-Flash-Maya-L-IQ3_S-00001-of-00004.gguf",
+  "gguf_dir": "E:\\progs\\Maya-data\\models\\Maya-L",
+  "written": "2026-10-13 00:00"
+ }
+}
