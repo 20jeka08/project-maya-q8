@@ -35,6 +35,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace strata::kernels::glmf {
@@ -127,7 +128,7 @@ public:
     /// Live counters of the fast path (both halves summed), for the driver's STAT lines.
     struct FastStats {
         uint64_t tokens = 0, hits = 0, misses = 0, miss_layers = 0;
-        uint64_t ram_hits = 0, disk_reads = 0, promotions = 0, cpu_experts = 0;
+        uint64_t ram_hits = 0, disk_reads = 0, promotions = 0, cpu_experts = 0, disk_skips = 0;
         double ms = 0, miss_ms = 0, disk_ms = 0, cpu_ms = 0;
         int64_t pool_slots = 0, pool_used = 0, ram_slots = 0, ram_used = 0;
         double pool_gb = 0, ram_gb = 0;
@@ -153,9 +154,23 @@ public:
     /// states and conv histories (the DSA caches are append-only, so the position alone restores them) - and
     /// restore it later to continue a prompt that extends the saved one.  false when unsupported.
     bool snapshot_save();
-    // the expert usage profile kept between sessions (the warm-up follows it): written after each request
+    // the expert usage file (opt-in, STRATA_GLM_USAGE=<file>: the warm-up follows it ahead of the expert profile):
+    // written after each request.  Without it nothing is kept between sessions but --expert-profile-save's profile.
     bool save_usage();
     std::string usage_path() const;
+    /// The expert profile (Strata's `profile.bin`, tools/make_profile.py --glm; setup passes the shipped
+    /// data/expert-profile-glm.bin): its ranking of every (layer, expert) pair decides how many VRAM slots each layer
+    /// gets and which experts the warm-up puts in them, in place of the pack's expert_counts.txt / expert_prior.txt.
+    /// Set before load_pack*: every half reads it.  Its layer axis is profile_layers(): the decoder layers, then the
+    /// NextN block.
+    void set_expert_profile(const std::string& path) { profile_path_ = path; }
+    int64_t profile_layers() const { return g_.n_layers + 1; }
+    /// --expert-profile-save: what the tiers learned, as a profile --expert-profile reads (rank_learned_profile over
+    /// every half: the experts in VRAM now, then the routing counted, then the profile this run started from).
+    bool save_expert_profile(const std::string& path, std::string& err);
+    /// --dump-routing: every route (the decode's and the prompt's) appended to `path` as Strata's trace records -
+    /// int32 layer, int32 k, then k int32 expert ids and k float weights - tools/make_profile.py's input.
+    static bool set_routing_dump(const std::string& path, std::string& err);
     bool snapshot_restore();
     int64_t snapshot_pos() const { return snap_pos_; }
     /// Conversation slots: the snapshot (its KDA states) and every DSA cache's rows up to its position, every half,
@@ -406,6 +421,7 @@ public:
     bool fast_mode_ = false;                               // decided at load (STRATA_GLM_SLOW=1 turns it off)
     bool host_logits_ = true;
     int last_tok_ = -1;                                    // the greedy argmax of the last fast forward
+    const strata::kernels::SamplerParams* mtp_sample_ = nullptr;   // decode_spec, STRATA_GLM_SPEC_SAMPLE: fast_mtp DRAWS
     int32_t force_tok_ = -1;                               // force_next()
     std::map<std::string, const uint16_t*> w16_;           // the pack's big BF16 rows, kept BF16 (fast mode)
     bool fast_setup(std::string& err);
@@ -437,6 +453,7 @@ public:
     void fast_ahead_reader();
     bool fast_boundary(std::string& err);                  // between tokens: apply finished promotions
     int fast_sample(strata::kernels::SamplerParams& sp, std::string& err);   // this half's logits, sampled on its stream
+    int fast_sample_verify(strata::kernels::SamplerParams& sp, std::string& err);   // speculative sampling's verify
     int64_t ram_budget_ = -1;                              // bytes of pinned RAM tier for this half (-1: derive)
     float* snap_ = nullptr;                                // the saved KDA states + conv histories (this half)
     // the DSA indexer's key / gate caches (ik, ig) are read only to pool each kpool-position block, so the fast path
@@ -452,6 +469,8 @@ public:
     void snap_pool_copy(bool restore);
     int64_t snap_pos_ = -1;
     std::string pack_dir_;
+    std::string profile_path_;                             // --expert-profile (empty: the pack's own files)
+    std::vector<std::pair<int32_t, int32_t>> profile_;     // its ranked (layer, expert) pairs, read by fast_setup
     bool fast_warm(std::string& err);                      // load-time: stream every expert into the tiers
     bool fast_cpu_lane_setup(std::string& err);            // STRATA_GLM_CPU_LANE: the pool, its calibration, the split
     void fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out);

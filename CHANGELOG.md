@@ -4,6 +4,77 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.4 - 2026-10-12
+
+The EXL3 quant works with the DFlash2 drafter, and on Windows + AMD a conversation taken back from a slot answers its
+own question again.
+
+- **EXL3 with the DFlash2 drafter** (#141 by @needmorevram). The drafter's verify window read each token's embedding
+  at the wrong row size for EXL3's BF16 table, so the answers turned to noise (#129, #140, #142), and on one and two
+  GPUs the window had no kernels for EXL3's experts. Both are fixed. A prompt asked again no longer drafts from the
+  previous answer, with every model. On two GPUs EXL3 decodes faster with the MTP block for now, and the speed
+  calibration keeps it there.
+- **Windows + AMD: a conversation taken back from a slot answered the other conversation's question, then looped**
+  (#133). A new conversation's state was zeroed on the GPU's default queue, which nothing made the engine's own queues
+  wait for, and Windows' HIP runtime holds queued work until the program waits on the GPU: the next conversation
+  started from the previous one's state. The state is now zeroed on the engine's compute queue and waited for.
+
+## v1.1.3 - 2026-10-12
+
+DFlash2 kept only where it is faster (a speed calibration on your PC), an expert profile that fills VRAM well from
+the first answer, an opt-in skip of the experts that would come from the SSD, and the EXL3 quant back in the Windows
+setup.
+
+- **The speed calibration** (DFlash2). DFlash2 makes some PCs faster and others slower: it depends on how much of the
+  model fits in the GPUs' memory, and on the CPU and the RAM. When the setup drafts with DFlash2 - and once, at the
+  first start after this update, for a config that already does - Maya measures it on your PC against the MTP block
+  (one GPU: against no drafting) and keeps the faster. It loads the model twice; each time it reads a long document,
+  writes about 1,500 tokens of answers after a warm-up (sampled as the dashboard samples, the same questions both
+  times) and compares the sustained speeds; DFlash2 stays only when it is more than 5% faster. 5-20 minutes, every
+  step shown. `./maya.sh --speed-calibration` measures again; `--draft dflash2 --no-speed-calibration` keeps DFlash2
+  without measuring.
+- **An expert profile for every GLM pack** (#88 by @needmorevram). A start fills VRAM by a profile built from
+  Maya-L's routing - code, math, eight languages, long documents and tool calls, with MTP drafting on - instead of
+  expert order or one machine's usage file: on 9 GPUs a fresh start decodes 35.4 -> 40.7 tok/s. The draft layer keeps
+  at least its card's equal share of slots. Learning across starts is opt-in (`--expert-profile-save FILE`), and the
+  usage file is read only when `STRATA_GLM_USAGE` names it. An installed config gets the profile at its next start.
+- **Skip the experts that would come from the SSD** (#109 by @Ajay9o9; opt-in, changes the answers).
+  `STRATA_GLM_DISK_SKIP_W=0.12`: where the model does not fit in VRAM + RAM, a routed expert held by neither and with
+  less than 12% of the route's weight is left out of the token instead of read from the SSD - an RTX 3090 with 60 GB
+  of RAM decoded 62% faster, an RX 7900 XTX 54%. The answers move away from the full model's, more the less RAM there
+  is: KL 0.12 with 60 GB of RAM (the top token the same 88% of the time), 0.19-0.23 with 24-40 GB (75-78%). Unset,
+  nothing changes.
+- **The experimental EXL3 quant is offered on Windows again**, as v1.1.0 released it; v1.1.1 had hidden it there
+  after one crash report (#129), which we are still looking into with its reporter.
+- The setup's DFlash2 choice says what it gives again - the same answers, faster - now that the speed calibration
+  checks it on every PC.
+
+## v1.1.2 - 2026-10-12
+
+Faster sampled answers, pictures in Claude Code's tool results, and a build fix for PCs with two CUDA toolkits.
+
+- **Sampled answers decode faster** (#92 by @0xPreDa). The sampler now picks the top_k tokens in one pass instead of
+  k scans of the vocabulary, and runs the draw chain on one thread: a sample takes about 0.07 ms instead of 1.5 ms at
+  top_k 20 on an RTX 4090 (11 ms at top_k 64, which `top_k` 0 also means). Sampled decode on 4x RTX 4090: +13%. The
+  picks are the same, token for token - checked on NVIDIA and AMD.
+- **Pictures in tool results reach the model** (#120 by @CoolJohn-lab, fixes #119). A picture inside an Anthropic
+  `tool_result` - how Claude Code's Read tool returns an image - was dropped before the image encoder; now the model
+  sees it.
+- **A second CUDA toolkit** (#124 by @fuad00): with `--nvcc` pointing at a toolkit other than the system's, the engine
+  and the image encoder now link that toolkit's runtime and cuBLAS; they took the system's before. A build that
+  already linked the wrong ones needs its `build/` folder removed once.
+- README: a 2x RTX 4090 row (#123 by @fuad00).
+
+## v1.1.1 - 2026-10-12
+
+A guard for a crash reported on v1.1.0, and clearer advice on the DFlash2 drafter.
+
+- **The setup no longer offers the experimental EXL3 quant on Windows** (#129). There an EXL3 model stopped at its
+  first prompt with an illegal memory access, after a 125 GB download. `--model EXL3-3.05bpw` still asks for it, with a
+  warning, while we look into it. Linux: nothing changes. Maya's own models are not affected.
+- **DFlash2: measure yours.** Where most experts come from RAM, the MTP block can stay faster than the drafter: an
+  RTX 3090 + 3060 with Maya-M decoded faster without it (#127). The setup and the docs say so; `--bench` tells.
+
 ## v1.1.0 - 2026-10-12
 
 Three big additions at once: Maya answers several requests together, drafts with a DFlash2 drafter, and runs EXL3

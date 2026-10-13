@@ -189,6 +189,16 @@ inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
 // so the RAM-free measurements add it.  0 without ZFS and elsewhere.
 int64_t zfs_arc_reclaimable();
 
+// --dump-routing (Glm5Model::set_routing_dump): whether a trace file is open, and one route appended to it as
+// Strata's trace record (int32 layer, int32 k, then k int32 expert ids and k float weights), under a lock - the
+// decode's CPU-lane threads (one per half) and the prompt path write to the same file
+bool route_dumping();
+void route_dump(int layer, int k, const int* ids, const float* w);
+
+// The expert usage file (opt-in, as Strata keeps nothing between starts but --expert-profile-save's profile):
+// STRATA_GLM_USAGE=<file>; unset or 0, none - the warm-up and the split search then go by the expert profile
+std::string usage_file();
+
 }  // namespace glmfast
 
 namespace gf = strata::kernels::glmf;
@@ -260,6 +270,7 @@ struct Glm5Model::FastState {
     float* mtp_logits = nullptr;
     int* mtp_tok = nullptr;
     int* mtp_tok_h = nullptr;    // pinned
+    void* spec_q = nullptr;      // speculative sampling (STRATA_GLM_SPEC_SAMPLE): the draft's kept list, a device SpecList
     cudaEvent_t ev_mtp = nullptr;
     // routing
     gf::MoeDev md;
@@ -541,6 +552,13 @@ struct Glm5Model::FastState {
     std::vector<float> cpu_x3;                               // EXL3: per expert gate / up inputs, h, down input, out
     float cpu_x3s[8][3] = {};                                // ... and the three prepared inputs' sums
     std::atomic<uint64_t> cpu_experts{0}, cpu_routes{0}, cpu_us{0};
+    // STRATA_GLM_SPEC_CANCEL=1 (the pipelined two-half decode, a head half of one GPU): the head's speculative pass reads
+    // the pinned, host-mapped word spec_live_h at every layer (skip_gate) into spec_skip_d - 1: its draft still stands,
+    // 0: the draft was wrong, its heavy kernels do nothing from that layer on and the redo can start at once
+    int* spec_live_h = nullptr;
+    int* spec_skip_d = nullptr;
+    bool spec_cancellable = false;   // spec_head: the pass it enqueues next is a speculative one (may be cancelled)
+    bool spec_gate = false;          // fast_layers: a skip_gate before every layer (set while that pass is enqueued)
     std::thread svc;
     std::atomic<bool> quit{false};
     uint64_t clock = 0;
@@ -548,6 +566,9 @@ struct Glm5Model::FastState {
     std::atomic<uint64_t> processed{0};  // ... and the service thread has consumed
     // stats (written by the service thread, read by anyone)
     std::atomic<uint64_t> hits{0}, misses{0}, miss_layers{0}, ram_hits{0}, disk_reads{0}, promotions{0};
+    std::atomic<uint64_t> disk_skips{0};   // STRATA_GLM_DISK_SKIP_W / _FROM: disk-only experts left out
+    int disk_skip_from = 8;                // ... at route rank >= this (8: none)
+    float disk_skip_w = 0.0f;              // ... or of a smaller weight share than this (0: none)
     std::atomic<uint64_t> scratch_uses{0}, demotions{0}, drops{0};
     std::atomic<uint64_t> miss_us{0}, disk_us{0};
     uint64_t tokens = 0;

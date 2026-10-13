@@ -16,6 +16,7 @@
 // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
 // resident experts are excluded, and every other layer's slots are untouched.
 #include "glm_fast_state.hpp"
+#include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -1015,10 +1016,22 @@ bool Glm5Model::fast_setup(std::string& err) {
                                      "encoder\n", dev_, per, vb >> 20);
             }
         }
-        // the slots PER LAYER: uniform, or - with the pack's expert_counts.txt (tools/glm_expert_prior.py) - by routing
-        // share: every layer gets a floor, then each further slot goes to the layer whose next-most-routed expert serves
-        // the largest share of its lookups (early layers spread their routing wide and gain the most).
-        // STRATA_GLM_UNIFORM_SLOTS=1 keeps the uniform split (A/B).
+        // the expert profile (--expert-profile, Strata's profile.bin): read once per half, before the split below
+        if (!profile_path_.empty() && profile_.empty()) {
+            int64_t pslots = 0;
+            std::string perr;
+            if (!read_expert_profile(profile_path_, profile_layers(), g.n_expert, profile_, pslots, perr)) {
+                err = "glm fast: --expert-profile: " + perr;
+                return false;
+            }
+            if (l0_ == 0)
+                std::fprintf(stderr, "glm fast: the expert profile %s ranks %zu (layer, expert) pairs\n",
+                             profile_path_.c_str(), profile_.size());
+        }
+        // the slots PER LAYER: uniform, or - with the expert profile, else the pack's expert_counts.txt
+        // (tools/glm_expert_prior.py) - by routing share: every layer gets a floor, then each further slot goes to the
+        // layer whose next-most-routed expert serves the largest share of its lookups (early layers spread their
+        // routing wide and gain the most).  STRATA_GLM_UNIFORM_SLOTS=1 keeps the uniform split (A/B).
         std::vector<int> nsl((size_t) NL, 0);
         for (int il = l0_; il < lt_; ++il)
             if (F->L[(size_t) il].moe) nsl[(size_t) il] = per;
@@ -1026,7 +1039,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         // layer rather than spending the capped budget on uneven partitions/spares.
         if (getenv("STRATA_GLM_UNIFORM_SLOTS") == nullptr && !(F->unified_memory && per == g.n_expert)) {
             std::vector<std::vector<double>> share((size_t) NL);
-            std::ifstream cf(pack_dir_ + "/expert_counts.txt");
+            // a profile's ranking as shares: each layer's experts in profile order, valued 1 / (1 + their rank in
+            // the whole profile) - the split below then gives the next slot to the layer whose next expert ranks
+            // highest, so VRAM fills in the profile's order (Strata's --expert-profile), above the floors
+            for (size_t r = 0; r < profile_.size(); ++r) {
+                const int il = profile_[r].first;
+                if (il >= l0_ && il < lt_ && F->L[(size_t) il].moe) share[(size_t) il].push_back(1.0 / (1.0 + (double) r));
+            }
+            std::ifstream cf(profile_.empty() ? pack_dir_ + "/expert_counts.txt" : std::string());
             std::string line;
             while (std::getline(cf, line)) {
                 std::istringstream ss(line);
@@ -1076,6 +1096,14 @@ bool Glm5Model::fast_setup(std::string& err) {
                         nsl[(size_t) il] = fl;
                         used += (size_t) fl * slot_stride(il);
                     }
+                // the draft layer (the NextN block, loaded on a split's last part) runs on every drafted token, so a
+                // miss there holds up each draft: it keeps at least the per-layer equal share, whatever its share of
+                // the routes (2x V100, Maya-S: the shipped profile left it 56 slots against 154-206 for the layers
+                // around it, decode 29.8 -> 28.6 tok/s).  The others hold the floor, so the budget has room for it.
+                if (mtp_il_ >= l0_ && mtp_il_ < lt_ && F->L[(size_t) mtp_il_].moe && per > fl) {
+                    used += (size_t) (per - fl) * slot_stride(mtp_il_);
+                    nsl[(size_t) mtp_il_] = per;
+                }
                 // the value of layer l's next slot: the routing share of its next expert (spares past the 288th serve none)
                 const auto gain = [&](int il) {
                     const auto& sh = share[(size_t) il];
@@ -1188,8 +1216,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->cnt.assign((size_t) NL * g.n_expert, 0);
         F->usage.assign((size_t) NL * g.n_expert, 0);
         F->pred_of.assign((size_t) NL, std::array<int, 8>{-1, -1, -1, -1, -1, -1, -1, -1});
-        std::fprintf(stderr, "glm fast: CUDA%d layers [%d,%d) expert pool %.2f GB, %d-%d slots/layer (%lld total)\n",
-                     dev_, l0_, l1_, (double) tot / 1073741824.0, nmin, nmax, (long long) F->pool_slots);
+        const std::string draft_sl = mtp_il_ >= l0_ && mtp_il_ < lt_ && F->L[(size_t) mtp_il_].moe
+                                         ? ", the draft layer " + std::to_string(nsl[(size_t) mtp_il_])
+                                         : std::string();
+        std::fprintf(stderr, "glm fast: CUDA%d layers [%d,%d) expert pool %.2f GB, %d-%d slots/layer%s (%lld total)\n",
+                     dev_, l0_, l1_, (double) tot / 1073741824.0, nmin, nmax, draft_sl.c_str(),
+                     (long long) F->pool_slots);
         if (getenv("STRATA_GLM_TIMING") != nullptr) {
             std::string sl;
             for (int il = l0_; il < lt_; ++il)
@@ -1472,6 +1504,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->upd_gen.assign(F->upd_at.size(), 0u);
         // disk reads: three slices per expert in parallel, through the staging above when the RAM tier has no free slot
         F->workers.reset(new Workers(8));
+        // STRATA_GLM_DISK_SKIP_FROM=<n>: a trunk expert at route rank >= n that is in neither VRAM nor the RAM tier is
+        // left out of the token instead of read from the disk (an approximation: off by default).  Where the experts do
+        // not fit in VRAM + RAM the disk reads are most of a token (a 3090 + 60 GB RAM beside one SATA SSD: ~13 reads,
+        // 155 of 190 ms) and they fall on the low ranks (ranks 4-7 held 63% of them in a chat).
+        if (const char* v = getenv("STRATA_GLM_DISK_SKIP_FROM")) F->disk_skip_from = std::max(0, std::min(8, std::atoi(v)));
+        // STRATA_GLM_DISK_SKIP_W=<share>: also, at any rank, a disk-only expert whose share of the route's weights is
+        // below this (the route's rank follows score + bias, the weight the score alone)
+        if (const char* v = getenv("STRATA_GLM_DISK_SKIP_W")) F->disk_skip_w = (float) std::max(0.0, std::atof(v));
         // LOOKAHEAD: the predictions per layer, a load state per RAM slot, and the reader threads
         if (const char* ah = getenv("STRATA_GLM_AHEAD")) F->n_ahead = std::max(0, std::min(gf::kAhead, std::atoi(ah)));
         if (g.n_expert > 512) F->n_ahead = 0;
@@ -2586,13 +2626,15 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
 }
 
 // ---------------------------------------------------------------- the usage profile
-// Where this machine's expert usage is kept between sessions: STRATA_GLM_USAGE=<file> (0: none), else
-// expert_usage.txt in the pack's folder.
-std::string Glm5Model::usage_path() const {
+// Where this machine's expert usage is kept between sessions: only STRATA_GLM_USAGE=<file> (opt-in; unset or 0: none).
+// As in Strata, a start goes by the expert profile and nothing else is learned across starts unless asked for
+// (--expert-profile-save).
+std::string glmfast::usage_file() {
     const char* u = getenv("STRATA_GLM_USAGE");
-    if (u != nullptr) return std::string(u) == "0" ? std::string() : std::string(u);
-    return pack_dir_.empty() ? std::string() : pack_dir_ + "/expert_usage.txt";
+    return u == nullptr || std::string(u) == "0" ? std::string() : std::string(u);
 }
+
+std::string Glm5Model::usage_path() const { return glmfast::usage_file(); }
 
 // Every half's long-memory routes ("layer e:count ..."), one file, written whole and renamed into place.
 bool Glm5Model::save_usage() {
@@ -2631,19 +2673,77 @@ bool Glm5Model::save_usage() {
     return std::rename(tmp.c_str(), up.c_str()) == 0;
 }
 
+// ---------------------------------------------------------------- the expert profile and the routing trace
+namespace glmfast {
+namespace {
+std::mutex g_route_mu;
+std::FILE* g_route_file = nullptr;
+}  // namespace
+bool route_dumping() { return g_route_file != nullptr; }
+void route_dump(int layer, int k, const int* ids, const float* w) {
+    const int32_t rec[2] = {(int32_t) layer, (int32_t) k};
+    std::lock_guard<std::mutex> lk(g_route_mu);
+    if (g_route_file == nullptr) return;
+    std::fwrite(rec, sizeof rec, 1, g_route_file);
+    std::fwrite(ids, sizeof(int32_t), (size_t) k, g_route_file);
+    std::fwrite(w, sizeof(float), (size_t) k, g_route_file);
+}
+}  // namespace glmfast
+
+bool Glm5Model::set_routing_dump(const std::string& path, std::string& err) {
+    std::lock_guard<std::mutex> lk(glmfast::g_route_mu);
+    if (glmfast::g_route_file != nullptr) std::fclose(glmfast::g_route_file);
+    glmfast::g_route_file = path.empty() ? nullptr : std::fopen(path.c_str(), "wb");
+    if (!path.empty() && glmfast::g_route_file == nullptr) {
+        err = "cannot write the routing trace " + path;
+        return false;
+    }
+    return true;
+}
+
+// What the tiers learned, as a profile: every half's experts in VRAM now (a fetch in flight counts: it lands), the
+// routes this run counted (and the usage file's, when STRATA_GLM_USAGE keeps one), then the profile this run started
+// from.
+bool Glm5Model::save_expert_profile(const std::string& path, std::string& err) {
+    if (fast_ == nullptr) {
+        err = "the expert profile needs the fast path";
+        return false;
+    }
+    const int64_t NL = profile_layers(), NE = g_.n_expert;
+    std::vector<uint8_t> resident((size_t) (NL * NE), 0);
+    std::vector<double> heat((size_t) (NL * NE), 0.0);
+    const std::vector<std::pair<int32_t, int32_t>>* prior = &profile_;   // (a half without MoE layers reads none)
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (prior->empty()) prior = &m->profile_;
+        FastState* F = m->fast_;
+        if (F == nullptr) continue;
+        std::lock_guard<std::mutex> lk(F->mu);
+        for (int il = m->l0_; il < m->lt_ && il < NL; ++il)
+            for (int64_t e = 0; e < NE; ++e) {
+                const size_t key = (size_t) (il * NE + e);
+                if (key < F->slot_of.size() && F->slot_of[key] >= 0) resident[key] = 1;
+                if (key < F->usage.size()) heat[key] = (double) F->usage[key];
+            }
+    }
+    return write_expert_profile(path, NL, NE, rank_learned_profile(NL, NE, resident, heat, *prior), err);
+}
+
 // ---------------------------------------------------------------- load-time warm-up
 // VRAM and the pinned RAM tier together hold (nearly) every routed expert, so the whole model is streamed from the
-// shards ONCE at load: each layer's most frequently routed experts (the pack's expert_prior.txt, written by
-// tools/glm_expert_prior.py from routing traces; id order without it) fill its VRAM slots - all but the spares - and
-// the rest fill the RAM tier (a few slots per class stay free for disk reads).  The first request then runs warm and
-// the disk is touched again only for experts that fit nowhere.  STRATA_GLM_WARM=0 skips it (the tiers fill on demand).
+// shards ONCE at load: each layer's experts in the expert profile's order (--expert-profile; without one the pack's
+// expert_prior.txt, written by tools/glm_expert_prior.py from routing traces; id order without either) fill its VRAM
+// slots - all but the spares - and the rest fill the RAM tier (a few slots per class stay free for disk reads).  The
+// first request then runs warm and the disk is touched again only for experts that fit nowhere.  STRATA_GLM_WARM=0
+// skips it (the tiers fill on demand).
 bool Glm5Model::fast_warm(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto t0 = std::chrono::steady_clock::now();
     const int NL = g.n_layers + 1;
     std::vector<std::vector<int>> order((size_t) NL);
-    {
+    for (const auto& [il, e] : profile_)
+        if (il >= 0 && il < NL && e >= 0 && e < g.n_expert) order[(size_t) il].push_back(e);
+    if (profile_.empty()) {
         std::ifstream pf(pack_dir_ + "/expert_prior.txt");
         std::string line;
         while (std::getline(pf, line)) {
@@ -2655,8 +2755,9 @@ bool Glm5Model::fast_warm(std::string& err) {
                 if (e >= 0 && e < g.n_expert) order[(size_t) il].push_back(e);
         }
     }
-    // THIS user's experts first: the usage profile of earlier sessions (save_usage) leads each layer's order, its
-    // counts become the long memory again, and the LFU counts start from them scaled to at most 32 (enough to keep
+    // With a usage file (STRATA_GLM_USAGE, opt-in) THIS user's experts first: the usage of earlier sessions
+    // (save_usage) leads each layer's order, ahead of the expert profile's, its counts become the long memory
+    // again, and the LFU counts start from them scaled to at most 32 (enough to keep
     // the profile's experts against one-off routes, little enough that a new task takes over within ~100 tokens;
     // a restart then hits ~75% instead of ~67% over the first 50 tokens on one V100, simulated)
     // the routing profile's counts per expert id (expert_counts.txt), for the blend below
@@ -2875,6 +2976,8 @@ void Glm5Model::fast_destroy() {
     if (F->cpu_ans_h) cudaFreeHost(F->cpu_ans_h);
     if (F->cpu_seq_d) cudaFree(F->cpu_seq_d);
     if (F->dcnt_d) cudaFree(F->dcnt_d);
+    if (F->spec_live_h) cudaFreeHost(F->spec_live_h);   // (STRATA_GLM_SPEC_CANCEL)
+    if (F->spec_skip_d) cudaFree(F->spec_skip_d);
     if (F->timing && F->ah_routes > 0) {
         std::string ov;
         for (int d = 0; d < F->n_ahead; ++d)
@@ -2984,6 +3087,7 @@ void Glm5Model::fast_destroy() {
     if (F->mtp_logits) cudaFree(F->mtp_logits);
     if (F->mtp_tok) cudaFree(F->mtp_tok);
     if (F->mtp_tok_h) cudaFreeHost(F->mtp_tok_h);
+    if (F->spec_q) cudaFree(F->spec_q);
     if (F->ev_mtp) cudaEventDestroy(F->ev_mtp);
     if (F->pool) cudaFree(F->pool);
     for (uint8_t* p : F->pool_more) cudaFree(p);
@@ -3085,6 +3189,7 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
         s.miss_layers += F->miss_layers.load();
         s.ram_hits += F->ram_hits.load();
         s.disk_reads += F->disk_reads.load();
+        s.disk_skips += F->disk_skips.load();
         s.promotions += F->promotions.load();
         s.cpu_experts += F->cpu_experts.load();
         s.cpu_ms += (double) F->cpu_us.load() / 1000.0;
@@ -3202,9 +3307,10 @@ void Glm5Model::fast_service() {
             last_route = std::chrono::steady_clock::now();
         }
         std::atomic_thread_fence(std::memory_order_acquire);
-        // (the lanes are made at the CPU lane's setup, after this thread started)
-        const bool held = win_merge && rq->win_n > 0 && F->cpu_ans_h != nullptr && F->win_lane[0] != nullptr &&
-                          F->win_lane[1] != nullptr;
+        // (the lanes are made at the CPU lane's setup, after this thread started; an EXL3 pack's routes go to the lanes
+        // a token each - win_cpu_merged runs the native kernels only)
+        const bool held = win_merge && !exl3_ && rq->win_n > 0 && F->cpu_ans_h != nullptr &&
+                          F->win_lane[0] != nullptr && F->win_lane[1] != nullptr;
         if (rq->error != 0) {
             if (held) {   // a window token's invalid route: nothing to compute, but it may be the layer's last
                 ++w_held;
@@ -3220,11 +3326,14 @@ void Glm5Model::fast_service() {
             const int il = rq->layer;
             const unsigned int miss = rq->miss_mask, fetch = rq->fetch_mask, promo = rq->promo_mask;
             const unsigned int cpu = rq->cpu_mask;   // the CPU lane's experts: not in VRAM, computed below
+            const unsigned int skip = rq->skip_mask;   // DISK SKIP: left out of this token (neither hit nor read)
+            if (skip != 0u) F->disk_skips.fetch_add((uint64_t) std::popcount(skip), std::memory_order_relaxed);
             auto& P = F->lp[(size_t) il];
             auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
             ++F->clock;
             int ids[8];
             for (int i = 0; i < K; ++i) ids[i] = rq->ids[i];
+            if (glmfast::route_dumping()) glmfast::route_dump(il, K, ids, rq->w);   // --dump-routing
             // STRATA_GLM_ROUTE_LOG=<prefix>: "layer e0 .. e7 tier-mask" per route into <prefix>.<device> (cache studies)
             // - the tier masks are fetch, miss and cpu (bits over e0..e7), then " | n0 .. n15": the near misses, the
             //   route's next ranks after the top k, best first
@@ -3245,7 +3354,7 @@ void Glm5Model::fast_service() {
                 if (F->cnt[(size_t) key] < (1u << 24)) ++F->cnt[(size_t) key];
                 if (++F->usage[(size_t) key] >= (1u << 30))
                     for (auto& u : F->usage) u >>= 1;
-                const bool resident = (((miss | fetch | cpu) >> i) & 1u) == 0;
+                const bool resident = (((miss | fetch | cpu | skip) >> i) & 1u) == 0;
                 if (resident) {
                     const int s = F->slot_of[(size_t) key];
                     if (s >= 0) P.tick[(size_t) s] = F->clock;
@@ -3617,7 +3726,8 @@ void Glm5Model::fast_ahead_route(int il, const int* ids, unsigned int miss, cons
         if (ahead[d][0] < 0 || la >= (int) F->layer_rc.size() || F->layer_rc[(size_t) la] < 0) continue;
         const int cls = F->layer_rc[(size_t) la];
         auto& R = F->rc[(size_t) cls];
-        for (int i = 0; i < K; ++i) {
+        // (with DISK SKIP only the ranks a route would wait for: the lower ones are left out when not held)
+        for (int i = 0; i < std::min(K, F->disk_skip_from); ++i) {
             const int e = ahead[d][i];
             if (e < 0) continue;
             const int key = la * g.n_expert + e;
@@ -4343,7 +4453,8 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
                   pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
                   pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
                   il == mtp_il_ ? mtp_skip_from() : trunk_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min,
-                  pf_rank, near_n);
+                  pf_rank, near_n, 0, nullptr, 0, il == mtp_il_ ? 8 : F->disk_skip_from,
+                  il == mtp_il_ ? 0.0f : F->disk_skip_w);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
     // the side stream copies the next layer's predicted experts while this layer computes.  STRATA_GLM_PREFETCH_AT:
@@ -4437,6 +4548,8 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         // a pipelined window's token: is it past a wrong draft by now (its heavy kernels then do nothing)
         if (F->win.pipe_t >= 0 && F->win.from != nullptr && F->win.skip_d != nullptr)
             gf::skip_gate(F->win.from, F->win.pipe_t, F->win.skip_d, s);
+        // the speculative pass of the two-half decode (STRATA_GLM_SPEC_CANCEL): was its draft found wrong meanwhile
+        if (F->spec_gate) gf::skip_gate(F->spec_live_h, 0, F->spec_skip_d, s);
         const auto body = [&]() -> bool {
         // ---- the attention-side read (fused with the previous FFN's write)
         gf::HcArgs h;
@@ -4727,7 +4840,11 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err) {
         err = "glm mtp: the head";
         return false;
     }
-    gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok, s);
+    if (mtp_sample_ != nullptr && F->spec_q != nullptr)   // speculative sampling (decode_spec): the draft is DRAWN
+        strata::kernels::sample_draft(F->mtp_logits, 1, (int) g.n_vocab, *mtp_sample_,
+                                      (strata::kernels::SpecList*) F->spec_q, F->mtp_tok, s);
+    else
+        gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok, s);
     cudaMemcpyAsync(F->mtp_tok_h, F->mtp_tok, sizeof(int), cudaMemcpyDeviceToHost, s);
     cudaEventRecord(F->ev_mtp, s);
     return true;
@@ -4744,6 +4861,23 @@ int Glm5Model::fast_sample(strata::kernels::SamplerParams& sp, std::string& err)
     strata::kernels::sample_tokens(sc_ + sc_logits, 1, (int) g_.n_vocab, nullptr, 0, sp, d_tok_, F->cs);
     cudaMemcpyAsync(F->tok_h, d_tok_, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm sampler", err) || !F->route_ok(err)) return -1;
+    return F->tok_h[0];
+}
+
+// Speculative sampling's verify (decode_spec, STRATA_GLM_SPEC_SAMPLE=1): this half's logits and the draft its NextN
+// block drew (mtp_tok, the list it was drawn from in spec_q) -> the draft with probability min(1, p/q), else a draw from
+// max(0, p - q); distributed as fast_sample's draw.  Same stream, same read-back as fast_sample.
+int Glm5Model::fast_sample_verify(strata::kernels::SamplerParams& sp, std::string& err) {
+    FastState* F = fast_;
+    cudaSetDevice(dev_);
+    if (F->spec_q == nullptr) {
+        err = "glm sampler (verify): no draft list";
+        return -1;
+    }
+    strata::kernels::sample_verify(sc_ + sc_logits, 1, (int) g_.n_vocab, sp, (const strata::kernels::SpecList*) F->spec_q,
+                                   F->mtp_tok, d_tok_, F->cs);
+    cudaMemcpyAsync(F->tok_h, d_tok_, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm sampler (verify)", err) || !F->route_ok(err)) return -1;
     return F->tok_h[0];
 }
 
@@ -4892,6 +5026,15 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     }
     cudaSetDevice(dev_);
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec head sync", err) || !F->route_ok(err)) return false;
+    // STRATA_GLM_SPEC_CANCEL: a speculative pass (decode_spec says so) reads the live word before every layer; it is
+    // set now, with the stream idle, so no earlier pass reads it any more.  Other passes (a redo, the confirmed token's)
+    // have no gates and never skip.  A head group of one GPU only (decode_spec checks)
+    const bool cancellable = F->spec_cancellable && hl == this && F->spec_live_h != nullptr && F->spec_skip_d != nullptr;
+    F->spec_cancellable = false;
+    if (cancellable) {
+        *(volatile int*) F->spec_live_h = 1;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
     lap(0);
     if (sprof) {
         if (spec_ev_[0] == nullptr)
@@ -4921,7 +5064,16 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
     gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
     lap(2);
-    if (!fast_layers(p, false, err)) return false;
+    if (cancellable) {
+        F->spec_gate = true;            // a skip_gate before each layer ...
+        gf::set_skip(F->spec_skip_d);   // ... and this pass's heavy kernels read its flag
+    }
+    const bool layers_ok = fast_layers(p, false, err);
+    if (cancellable) {
+        F->spec_gate = false;
+        gf::set_skip(nullptr);
+    }
+    if (!layers_ok) return false;
     for (Glm5Model* m = this; m != hl; m = m->split_next_.get())
         if (!m->hop_to_next(m->split_next_.get(), p, err)) return false;
     lap(3);
@@ -5046,6 +5198,45 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             }
         cudaSetDevice(dev_);
     }
+    // STRATA_GLM_SPEC_CANCEL=1 (opt-in): a wrong draft stops the head's speculative pass at its next layer (spec_head
+    // arms a skip_gate before each of its layers) and the redo is enqueued at once, before the next draft - instead of
+    // after the rest of a pass already known to be thrown away.  Only a head group of one GPU (two-GPU splits).
+    static const bool cancel_env = [] {
+        const char* v = getenv("STRATA_GLM_SPEC_CANCEL");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    bool cancel = cancel_env && hl == this;
+    if (cancel && (fast_->spec_live_h == nullptr || fast_->spec_skip_d == nullptr)) {
+        cudaSetDevice(dev_);
+        if (fast_->spec_live_h == nullptr) {
+            int* h = nullptr;
+            if (cudaHostAlloc((void**) &h, 64, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
+                h[0] = 1;
+                fast_->spec_live_h = h;
+            } else {
+                cudaGetLastError();
+            }
+        }
+        if (fast_->spec_skip_d == nullptr) {
+            if (cudaMalloc((void**) &fast_->spec_skip_d, sizeof(int)) == cudaSuccess) {
+                cudaMemsetAsync(fast_->spec_skip_d, 0, sizeof(int), fast_->cs);
+            } else {
+                cudaGetLastError();
+                fast_->spec_skip_d = nullptr;
+            }
+        }
+        if (fast_->spec_live_h == nullptr || fast_->spec_skip_d == nullptr) {
+            std::fprintf(stderr, "glm spec: STRATA_GLM_SPEC_CANCEL - its buffers did not allocate; decoding without it\n");
+            cancel = false;
+        }
+    }
+    static bool cancel_said = false;
+    if (cancel_env && !cancel_said) {
+        cancel_said = true;
+        std::fprintf(stderr, "glm spec: %s\n", cancel ? "a wrong draft cancels the head's speculative pass at its next layer "
+                                                        "(STRATA_GLM_SPEC_CANCEL)"
+                                                      : "STRATA_GLM_SPEC_CANCEL needs a head group of one GPU - not used");
+    }
     // the head group's recurrent-state backups (each part on its own device and stream)
     const auto kda_all = [&](bool restore) -> bool {
         for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get()) {
@@ -5055,6 +5246,33 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         cudaSetDevice(dev_);
         return true;
     };
+    // STRATA_GLM_SPEC_SAMPLE=1 (opt-in): SPECULATIVE SAMPLING for sampled requests - the NextN block's draft is
+    // DRAWN from its own distribution q and the model's token is the draft with probability min(1, p/q), else a draw
+    // from max(0, p - q): the tokens keep the plain draw's distribution exactly, and a draft stands sum(min(p, q)) of
+    // the time instead of p(argmax q).  A fixed seed still gives the same answer - but not the plain draw's answer.
+    // Greedy requests (and penalties, which this path does not take) keep the argmax draft and the exact match.
+    static const bool spec_sample_env =
+        getenv("STRATA_GLM_SPEC_SAMPLE") != nullptr && std::atoi(getenv("STRATA_GLM_SPEC_SAMPLE")) != 0;
+    const bool spec_sample = spec_sample_env && !sp.greedy && sp.temperature > 0.0f && sp.penalty_last_n <= 0;
+    if (spec_sample && TL->fast_->spec_q == nullptr) {
+        cudaSetDevice(TL->dev_);
+        if (cudaMalloc(&TL->fast_->spec_q, sizeof(strata::kernels::SpecList)) != cudaSuccess) {
+            cudaGetLastError();
+            TL->fast_->spec_q = nullptr;
+            cudaSetDevice(dev_);
+            err = "glm spec: the speculative-sampling list did not allocate";
+            return false;
+        }
+        cudaSetDevice(dev_);
+        std::fprintf(stderr, "glm spec: speculative sampling ON (STRATA_GLM_SPEC_SAMPLE) - sampled requests draw the draft "
+                             "from the draft block and keep it with min(1, p/q)\n");
+    }
+    struct MtpSampleOff {   // fast_mtp draws only inside this request's decode
+        Glm5Model* m;
+        ~MtpSampleOff() { if (m != nullptr) m->mtp_sample_ = nullptr; }
+    } mtp_sample_off{spec_sample ? TL : nullptr};
+    if (spec_sample) TL->mtp_sample_ = &sp;
+    bool have_draft = false;   // the verify needs a draft drawn for its position: none before the first one
     // the tail's token for its last position: the argmax it left, or a sample from its logits
     const auto take = [&](int& y) -> bool {
         if (sp.greedy) {
@@ -5062,7 +5280,8 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             if (!glmfast::wait_event(TL->fast_->ev_done, "glm spec token", err)) return false;
             y = TL->fast_->tok_h[0];
         } else {
-            y = TL->fast_sample(sp, err);   // the tail group's last part holds the logits
+            // the tail group's last part holds the logits (and, with speculative sampling, the draft's list)
+            y = (spec_sample && have_draft) ? TL->fast_sample_verify(sp, err) : TL->fast_sample(sp, err);
             if (y < 0) return false;
         }
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
@@ -5077,6 +5296,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         if (!TL->fast_mtp(p, next, err)) return false;
         if (!glmfast::wait_event(TL->fast_->ev_mtp, "glm spec draft", err) || !TL->fast_->route_ok(err)) return false;
         d = TL->fast_->mtp_tok_h[0];
+        have_draft = true;
         return true;
     };
     const auto check = [&]() -> bool {
@@ -5109,6 +5329,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         err = "glm spec: the recurrent-state backup did not allocate";
         return false;
     }
+    if (cancel) fast_->spec_cancellable = true;   // q+2 with the draft: speculative
     if (!spec_head(q + 2, d, err)) return false;
     bool ok = true;
     // STRATA_GLM_SPEC_PROF=1: host time per phase of a step (debug)
@@ -5144,15 +5365,25 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         ++produced;
         const bool more = emit(y2) && produced < max_new && q + 3 < max_ctx_;
         if (!more) break;
+        const bool wrong = d != y2;
+        // (STRATA_GLM_SPEC_CANCEL) a wrong draft: the head's speculative pass for q+2 stops at its next layer, its
+        // states are restored behind it and the redo goes in now - the head redoes q+2 while the tail drafts
+        if (cancel && wrong) {
+            *(volatile int*) fast_->spec_live_h = 0;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            kda_all(true);
+            if (!spec_head(q + 2, y2, err)) { ok = false; break; }
+            lap(2);
+        }
         // (2) the draft for q+3 from (h_{q+1}, y2)
         int d2 = -1;
         if (!draft(q + 1, y2, d2)) { ok = false; break; }
         lap(1);
         // (3) the head's speculative position q+2 stands iff its draft was y2; else restore and redo it
         ++spec_steps_;
-        if (d == y2) {
+        if (!wrong) {
             ++spec_hits_;
-        } else {
+        } else if (!cancel) {
             kda_all(true);
             if (!spec_head(q + 2, y2, err)) { ok = false; break; }
         }
@@ -5162,6 +5393,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         if (!B->spec_tail(hl, q + 2, err)) { ok = false; break; }
         lap(3);
         kda_all(false);
+        if (cancel) fast_->spec_cancellable = true;   // q+3 with the new draft: speculative
         if (!spec_head(q + 3, d2, err)) { ok = false; break; }
         lap(4);
         ++np;
@@ -5287,6 +5519,8 @@ bool Glm5Model::snapshot_restore() {
         cudaStreamSynchronize(m->fast_->cs);
         m->pos_ = m->snap_pos_;
     }
+    // the drafter's positions from here on belong to the previous continuation
+    if (cap_d_ != nullptr) cap_d_->reset(pos_);
     cudaSetDevice(dev_);
     return true;
 }

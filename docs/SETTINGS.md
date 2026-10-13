@@ -14,7 +14,8 @@ threads - more threads than the memory can feed only wait, and on a hybrid CPU t
 up - and, when part of the model is read from the SSD, with smaller disk reads (the best size depends on the drive and
 its driver). Every measurement answers prompts it has not answered before, as a chat's text is new to the expert tiers (the
 same few answers over and over left VRAM holding exactly their experts, and the speed it reported was one no chat
-reached), and the engine works on a copy of your expert usage file, so the tuning's answers do not change what the
+reached), and the engine saves no learned expert profile (`--expert-profile-save`) and works on a copy of a usage
+file (`STRATA_GLM_USAGE`), so the tuning's answers do not change what the
 next start loads first. A setting is kept when it is more than 3% faster than the engine's own choice. The result
 goes into the config's `"env"` (`STRATA_GLM_PCIE_SHARE`, `STRATA_GLM_CPU_LANE`, `STRATA_GLM_READ_CHUNKS`) and into
 `~/.config/project-maya/calibration.json` for this PC, model and context, so setting up again keeps it. Stop a
@@ -44,7 +45,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_PREFILL_LEND_PCT`, `STRATA_GLM_PREFILL_MB` | 90 or 85, unset | `--prefill auto`: the share of each card's expert-pool slots a prompt may borrow for its buffers: 90 when at least 90% of the experts' bytes are held pinned (in VRAM or the RAM tier), else 85 - or a fixed budget in MB |
 | `STRATA_GLM_PREFILL_TAIL_SKIP` | on | single-device prompts without a loaded NextN/MTP block: skip the last layer's attention output projection and FFN after updating all its caches; `0` restores the full computation. Splits and `GLM_CB_DIR` seam dumps keep the full path |
 | `STRATA_GLM_PREFILL_WINDOW` | the chunk's tokens | prompts: the expert output rows kept on the GPU at once - each expert set's rows are added into the layer's output as the window fills, instead of every routed row waiting for one combine (~40 KB a token instead of ~185, so a chunk holds ~2x the tokens); `0` = every row (the old layout) |
-| `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | where your expert usage is kept between starts (the warm-up loads your experts first); `0` = off |
+| `STRATA_GLM_USAGE` | off | a file to keep your expert usage in between starts (written after every request; the warm-up then loads your experts ahead of the expert profile's). Off, a start goes by the expert profile alone (below); a pack's old `expert_usage.txt` is no longer read unless this names it |
 | `STRATA_GLM_SLOTS` | 4 | conversations kept aside on the SSD, so switching back to one doesn't re-read its prompt; `0` = off |
 | `STRATA_GLM_SLOT_MIN`, `STRATA_GLM_SLOT_GB`, `STRATA_GLM_SLOT_DIR` | 1024, 16, `<pack>/slots` | the shortest conversation kept aside (tokens, down to 1), their total size on disk (GB), and the folder |
 | `STRATA_GLM_SLOT_KEEP`, `STRATA_GLM_SLOT_DAYS` | off, 7 | `1`: the kept conversations outlive the engine - the folder is not emptied at start (a slot is kept when its `.meta` names this model, engine version and pack, else removed), the conversation in the model is kept when the engine ends, and a slot unused for `STRATA_GLM_SLOT_DAYS` days is removed. With a supervisor that stops the model when it idles (llama-swap), the next request after a restart reads only its new tokens (a 4K-token conversation back in 0.2 s instead of re-read) |
@@ -58,7 +59,10 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_GLM_MTP_GGUF` | the model's own | two GPUs or more: a GGUF holding the MTP draft block to draft with - for a model published without one, or a more precise block than its own (`tools/maya_quant/mtp_gguf.py` writes a model's block alone); `STRATA_GLM_NO_MTP=1` = no drafting |
 | `STRATA_GLM_MTP_KEEP` | 2 | two GPUs or more: the draft block computes the experts it is missing from VRAM only among its route's n best-scored ones (CPU lane / PCIe as for any route) and skips the rest - a draft only has to be a good guess, but a rejected one costs the first GPU a redo. `2` drafts better than skipping all and was never slower (2x V100: 82-83% accepted against 76-81%; RTX 3090 + 3060: 19.5 -> 20.6 tok/s); `0` = skip every missing expert, `STRATA_GLM_MTP_MISS=1` = fetch them all |
 | `STRATA_GLM_TRUNK_KEEP`, `STRATA_GLM_TRUNK_KEEP_MAP` | unset (8) | **changes the answers** - for a RAM-bound split that would rather be faster: the model's own layers leave out the experts they are missing from VRAM from route rank n on, as the draft block does; `_MAP` = one digit per layer (`8` = every expert). The lowest-ranked experts carry the least weight and are the coldest; GLM-5.3's early layers notice a left-out expert far more than its late ones (keep 5 in one band of layers at a time, Maya-M, KL to the full model on held-out text: layers 3-7 0.040, 23-29 0.012, 30-44 0.002-0.003). RTX 3090 + 3060, decode at 21K: Maya-M 20.0 -> 24.6 tok/s with `_MAP=8888888888888888888888855555554444444444444448` (keep 5 on layers 23-29, 4 on 30-44) and split 28, KL 0.018 (code 0.017), where a uniform `TRUNK_KEEP=7` gives 21.8 at 0.032; Maya-L +25% with the same map and split 27, KL 0.017 |
+| `STRATA_GLM_DISK_SKIP_W`, `STRATA_GLM_DISK_SKIP_FROM` | off (0, 8) | **an approximation, for experts that do not fit in VRAM + RAM**: a routed expert in neither VRAM nor the RAM tier is left out of the token instead of read from the SSD when its share of the route's weights is below `STRATA_GLM_DISK_SKIP_W`, or its rank (0-7, the route's order: score + bias) is at least `STRATA_GLM_DISK_SKIP_FROM`. The weight rule leaves out what matters least: a 3090 with 60 GB of RAM and 74 GB of experts on a PCIe 4 NVMe, `--bench` decode 13.3 -> 21.6 tokens/s at `_W=0.12`; KL against the full computation (CPU lane off, 575 tokens): `_W=0.12` 0.12, `_W=0.14` 0.15, `_FROM=6` 0.08, `_FROM=4` 0.11 (Maya-S is 0.43 from FP8; the CPU lane's own arithmetic moves the output by ~0.06). The engine log's `glm skip` line counts the experts left out. Lookahead (`STRATA_GLM_AHEAD`) then reads only the ranks a route would wait for |
 | `STRATA_GLM_SPEC_HEAD` | half the GPUs | more than two GPUs: how many of the split's first GPUs form the head group of the speculative decode - the head group runs the draft's position while the rest finish the current token, as the two halves of a two-GPU split do (4x Tesla T4, Maya-S: decode 14.1 -> 21.0 tok/s against no drafting); `STRATA_GLM_NO_SPEC=1` = token by token |
+| `STRATA_GLM_SPEC_CANCEL` | off | two GPUs (a head group of one GPU): `1` = when the tail's token shows that the draft was wrong, the head's speculative pass for it stops at its next layer (its heavy kernels do nothing, its routes go out empty) and the redo starts at once, while the tail drafts - instead of after the rest of a pass already known to be thrown away. The tokens are the same (greedy, CPU lane and layer map off: three requests identical to the token, 166 cancels in one of them). RTX 3090 + 3060, Maya-M: 5.4-6.5 ms of the first GPU's time saved per rejected draft (greedy, identical text: decode +0.9 to +2.6 %); at 21K with sampling it stayed within the run-to-run noise there (+0.6-1.2 %) - it pays more where the first GPU paces more clearly and more drafts are rejected. With `STRATA_GLM_SPEC_SAMPLE=1` the two add up: +5.3 % together on that box (the first GPU's average pass 31.6 -> 30.4 ms) |
+| `STRATA_GLM_SPEC_SAMPLE` | off | two GPUs or more (the pipelined decode), sampled requests: `1` = speculative sampling - the draft block's draft is DRAWN from its own distribution q (the request's sampler chain on its logits, a Philox stream of its own) and the token is the draft with probability min(1, p/q), else a draw from max(0, p - q): the tokens keep the plain draw's distribution exactly, and a draft stands sum(min(p, q)) of the time instead of p(the draft block's top token). A fixed seed still repeats its answer - not the answer it gives without this. Greedy requests (and penalties, which this path does not take) are unchanged. RTX 3090 + 3060, Maya-M, 21K, default sampling: drafts kept 68.6 -> 74.7 %, decode +1.6-2.7 % alone, +5.3 % with `STRATA_GLM_SPEC_CANCEL=1` (24.30 -> 25.57 tok/s) |
 | `STRATA_GLM_SERVICE_IDLE_MS` | 200 | the engine's tier threads (one per GPU) spin while a decode routes experts and sleep after this long without one, so an idle engine uses ~1% of a core instead of one core per GPU; `0` = spin always |
 | `STRATA_GLM_PREFILL_CPU` | on | prompts: the least routed RAM-tier experts are computed on the CPU while the GPU loads the rest over PCIe, the split balanced each layer so both finish together; `0` = off. `STRATA_GLM_PREFILL_CPU_ROW_MS` fixes the CPU cost of a row it plans with (default: learned) |
 | `STRATA_GLM_PRESTAGE` | 160 on one GPU, 0 on more | prompts: experts copied to the GPU while a layer's attention runs (the PCIe link is idle then), into a buffer of this many experts borrowed from the pool's tail - the next layer's most routed RAM-tier ones; `0` = off. `STRATA_GLM_PRESTAGE_ADAPT=1` (experimental, not yet measured) learns each layer's count from how long its attention takes |
@@ -71,7 +75,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_GLM_PREFILL_ATTN` | tensor cores | prompts' sparse attention kernel: on Ampere and newer an mma.sync kernel with 32 heads a block (a 3090, 26.6K-token prompt: 832 -> 966 tok/s); `wmma` = the 91 KB shared-memory kernel Volta runs, `tcreg` = the register kernel Turing runs, `f32` = the FP32 kernel. AMD: `wmma2`, the default on gfx12 (R9700 / RX 9070: prompts +8-10%), or `f16q`, the default on gfx11 and Strix Halo. `STRATA_GLM_PREFILL_ATTN_CHECK=1` compares the chosen kernel with the FP32 one (debug) |
 | `STRATA_GLM_EXL3_MMA_ROWS` | 64 | EXL3 packs' prompts: an expert routed at most this many of a chunk's tokens runs in tensor-core kernels that decode its trellis as they go (RTX 30 and newer); a busier one is decoded to FP16 once and multiplied by cuBLAS. `0` = cuBLAS for every expert |
 | `STRATA_GLM_DROP_CACHE` | on with 2+ NUMA nodes | before the RAM tier is pinned, the model files' clean page cache is dropped (the engine reads experts with O_DIRECT): a cached GGUF filling one node made the interleaved tier land 78% on the other, and the CPU lane read one socket's memory; `0` = keep it |
-| `STRATA_GLM_PROFILE_WEIGHT` | 1 | the weight of the pack's routing profile (`expert_counts.txt`) against your usage file in the start-up order of the expert tiers; `0` = your usage only |
+| `STRATA_GLM_PROFILE_WEIGHT` | 1 | with `STRATA_GLM_USAGE`: the weight of the pack's routing profile (`expert_counts.txt`) against your usage file in the start-up order of the expert tiers; `0` = your usage only |
 | `STRATA_GLM_LOOP_THINK`, `STRATA_GLM_LOOP_ANSWER` | 256, 1024 | the loop guard: when the last this-many generated tokens are one pattern of at most 32 tokens repeated exactly (a quantized model can fall into `0 0 0 ...` until `max_tokens`), thinking is closed at once, and in the answer the model's current tool-call argument (or else the turn) is closed so an agent goes on; a second loop in the same answer ends it. `0` = off |
 | `STRATA_GLM_WIN_PIPE` | three GPUs or more | DFlash2 on a split: `1` = the pipelined verify window (the GPUs on consecutive tokens at once), `0` = the batched one (the whole window a GPU at a time). Two GPUs take the batched one, three or more the pipelined one |
 | `STRATA_GLM_WIN_THREADS`, `STRATA_GLM_WIN_SKIP` | on | the pipelined window (A/B): `0` = one host thread issuing every GPU's work (nine GPUs: 3-5 ms a token, longer than any GPU's share) / the tokens after a wrong draft run their work anyway |
@@ -89,10 +93,30 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_ENGINE_WRAP_S` | 40 | the server: on a stop, a request in progress is wrapped up instead of dropped - its thinking is closed at once and it answers for up to this long (then it is cut), so the client gets an answer and the turn ends; requests still queued are refused. Keep it plus the engine's end inside the supervisor's grace (llama-swap's `unloadTimeout`); `0` = cut at once |
 | `STRATA_FAIR_SLICE_S` | 0 (off) | the server: an answer that has been decoding this many seconds while another request waits gives the engine to it and continues afterwards, from where it was (the engine keeps its state with what it wrote: one token is read again). Concurrent chats and an agent's side requests no longer wait for a whole answer (4x RTX 4090, a short question during a 3000-token answer: first token after 34 s -> 13-17 s at 15-20). Each switch sets a conversation aside on disk (0.1-1 s up to 100K tokens on a SATA SSD array), so a slow disk wants a longer slice |
 
-**A routing profile for a GGUF of your own.** At start the engine fills VRAM with each layer's most used experts:
-your usage file (above) blended with the pack's profile, `expert_counts.txt` / `expert_prior.txt`. To make one, start
-the model with `STRATA_GLM_USAGE=/tmp/profile.txt` (a fresh file), send it requests typical of your use (code, docs,
-chat, languages), stop it, then run `python tools/glm_expert_prior.py <pack folder> /tmp/profile.txt`.
+**The expert profile** (`data/expert-profile-glm.bin`). At start the engine fills VRAM with the experts a profile ranks
+first. That profile ranks every (layer, expert) pair, and its order also decides how many VRAM slots each layer
+gets - except the MTP draft layer on a split, which runs on every drafted token and so keeps at least an equal share
+of its card's slots. Setup passes the shipped one, `data/expert-profile-glm.bin`, to every model (`--expert-profile` in the config's
+`"args"`; a config written before it gets it at its next start, so an update needs no setup). It comes from the
+router's routing, so it serves every quant of GLM-5.3-Flash: a routing trace of Maya-L with the MTP draft block
+running, over 66 requests (code, math with thinking, chat, eight languages, tool calls, long documents). Maya-L on an
+RTX 3090 + 8x RTX 5060 Ti, a fresh start: decode 40.7 tok/s on average against 35.4 without a profile, 96% of the
+routes served from VRAM at first against 89%. Nothing is learned across starts unless you ask for it: while it runs,
+the engine still moves the experts you use into VRAM, but the next start begins from the profile again. These engine
+arguments go in the config's `"args"`; a setup again keeps them:
+
+| Argument | What it does |
+| --- | --- |
+| `--expert-profile FILE` | start from this profile instead of the shipped one |
+| `--expert-profile-save FILE` | save what the expert tiers learned as a profile: the experts in VRAM, then the routing counted, then the profile it started from. Written on exit and every `--expert-profile-save-every MIN` minutes between requests (default 10; `0` = on exit only). Point `--expert-profile` at it to start from there (a file of your own, not the shipped one: a setup again keeps it) |
+| `--dump-routing FILE` | write every route (prompt and answer) as a routing trace, `tools/make_profile.py`'s input |
+
+To build a profile for your own use: start the model once with `--dump-routing /tmp/trace.bin`, send it requests
+typical of your use (code, docs, chat, languages), stop it, then run
+`python tools/make_profile.py --glm --no-base /tmp/trace.bin --out my-profile.bin`. The tool also reads the engine's
+text records - a usage file (`STRATA_GLM_USAGE`), a pack's `expert_counts.txt` - and `--equal` weighs several inputs
+the same. Without any profile, the engine reads a pack's own `expert_counts.txt` / `expert_prior.txt`
+(`tools/glm_expert_prior.py`), else fills in expert order.
 
 **Prompt chunks** (`--prefill`). The engine reads a prompt in chunks, and every expert a chunk routes to is
 copied into VRAM once per chunk, so larger chunks read long prompts faster; a chunk's buffers are borrowed from the
@@ -134,7 +158,9 @@ the size. With N above 1 the engine decodes without a [DFlash2 drafter](#draftin
 [on Hugging Face](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF); its license is CC BY-NC-ND 4.0:
 non-commercial use only) and passes it as `--dflash GGUF` in the config's `"args"`; NVIDIA GPUs, one request at a time
 (`--parallel 1`). The setup offers it on RTX 30 / A100 and newer (sm_80): on Tesla V100s it decoded slower than the MTP
-block, on one GPU and on two.
+block, on one GPU and on two. How much it gains also depends on the PC - where most experts come from RAM, checking
+the drafts can cost more than they save (an RTX 3090 + 3060 with Maya-M, #127) - so the setup measures it there
+([the speed calibration](#the-speed-calibration)).
 
 A DFlash2 drafter made for GLM-5.3-Flash - a small block drafter that reads
 the model's hidden states at five of its layers and drafts up to 7 tokens in one pass, with the model's own embedding
@@ -184,3 +210,15 @@ One RTX 3090 (the MTP block is not loaded on one GPU: plain decode), and the 309
 | 3090, DFlash2 (two runs) | 19.4 | 20.6 | 20.2 | 17.1 | 16.4 | **18.8 (+19%)** |
 | 3090 + 5060 Ti, the MTP block (three runs) | 20.9 | 21.3 | 21.9 | 16.7 | 19.4 | 19.7 |
 | 3090 + 5060 Ti, DFlash2 (three runs) | 23.2 | 24.2 | 25.8 | 19.4 | 19.2 | **22.1 (+12%)** |
+
+### The speed calibration
+
+When the setup drafts with DFlash2 - and once, at the first start after an update, for a config that already drafts
+with it - Maya measures it on your PC against the MTP block (one GPU: against decoding without drafting) and keeps
+the faster. It loads the model twice, the same config without and with `--dflash`. Each time it reads a long document
+(about 8,000 tokens, the depth of a real conversation) and answers once to warm up - not counted - then answers fresh
+questions about it, sampled as the dashboard samples (the same questions and seeds both times), until about 1,500
+tokens are written. The sustained speed - all those tokens over all the time spent writing them - decides: DFlash2
+stays only when it is more than 5% faster. It takes 5-20 minutes and shows each step as it goes. The result is kept in
+the config (`installer.speed_calibration`); `./maya.sh --speed-calibration` measures again (new GPUs, more RAM), and
+`--draft dflash2 --no-speed-calibration` keeps DFlash2 without measuring.

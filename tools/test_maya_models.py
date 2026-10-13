@@ -312,9 +312,11 @@ class Exl3Download(unittest.TestCase):
         return quant, "\n".join(lines)
 
     def test_offered_on_nvidia_as_experimental_never_the_default(self):
-        quant, text = self.offered("cuda")
-        self.assertIn(f"{self.Q}: download 125.3 GB from Hugging Face   (experimental)", text)
-        self.assertNotEqual(quant, self.Q)
+        for win in (False, True):   # Linux and Windows alike
+            with patch.object(maya, "WIN", win):
+                quant, text = self.offered("cuda")
+            self.assertIn(f"{self.Q}: download 125.3 GB from Hugging Face   (experimental)", text)
+            self.assertNotEqual(quant, self.Q)
 
     def test_not_offered_with_amd(self):
         self.assertNotIn(self.Q, self.offered("hip")[1])
