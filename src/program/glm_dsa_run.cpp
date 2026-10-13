@@ -386,6 +386,8 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-check") check = true;
         else if (a == "--batched") batched = true;
         else if (a == "--max-context") ctx = std::atoll(next().c_str());
+        else if (a == "--layer-split") (void) next();   // (Maya's server adds it for several GPUs: here every visible
+                                                         // GPU is a lane of the long-prompt experts instead)
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
             return 2;

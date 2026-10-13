@@ -13,7 +13,8 @@
  "tokenizer": "E:\\.lmstudio\\models\\unsloth\\GLM-5.3-GGUF\\glm-dsa\\tokenizer",
  "model_name": "glm-5.3",
  "gpu": [
-  1
+  1,
+  0
  ],
  "sampling": {
   "temperature": 1.0,

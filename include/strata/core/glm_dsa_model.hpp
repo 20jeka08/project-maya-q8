@@ -246,17 +246,7 @@ private:
     // the graph decode: a stream, per layer A (attention inputs), B (out-proj .. router), S (shared expert),
     // C (the routed result back + residual); pinned host words; the position on the device
     void* gstream_ = nullptr;
-    // GPU experts: two group buffers, their events, the copy stream, MMQ's context, the row tables
-    int gm_tmax_ = 0, gm_group_ = 0;
-    size_t gm_stride_ = 0;
-    void* gm_w_[2] = {};
-    void* gm_ready_[2] = {};
-    void* gm_free_[2] = {};
-    void* gm_copy_ = nullptr;
-    void* gm_ctx_ = nullptr;
-    int *gm_bounds_ = nullptr, *gm_row_tok_ = nullptr, *gm_row_slot_ = nullptr, *gm_iota_ = nullptr;
-    void *gm_xq_ = nullptr, *gm_hq_ = nullptr;
-    float *gm_gu_ = nullptr, *gm_h_ = nullptr, *gm_dn_ = nullptr;
+    void* gm_ = nullptr;            ///< the GPU experts' lanes (GmState, src/core/glm_dsa_gpu_moe.cu)
     bool gm_registered_ = false;
     std::vector<void*> gm_regs_;
     std::vector<void*> gA_, gB_, gS_, gC_;

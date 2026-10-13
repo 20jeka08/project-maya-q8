@@ -564,28 +564,6 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
                                  std::sqrt(d / std::max(n, 1e-30)), std::sqrt(d0 / std::max(n0, 1e-30)), std::sqrt(n), gpu[0], gpu[1], gpu[2],
                                  hb_moe_[0], hb_moe_[1], hb_moe_[2]);
                     std::fputc(10, stderr);
-                    // per (token, slot): the GPU's down rows against the CPU's
-                    const int64_t SK = (int64_t) T * g.n_exp_used;
-                    std::vector<float> dn((size_t) SK * E);
-                    PF_CUDA(cudaMemcpy(dn.data(), gm_dn_, dn.size() * sizeof(float), cudaMemcpyDeviceToHost));
-                    int64_t nan_slots = 0, bad = 0;
-                    for (int64_t j = 0; j < SK; ++j) {
-                        double dd = 0, nn = 0;
-                        bool isnan_ = false;
-                        for (int e = 0; e < E; ++e) {
-                            const float a = dn[(size_t) j * E + e], b = hb_dn_[(size_t) j * E + e];
-                            if (!std::isfinite(a)) isnan_ = true;
-                            dd += (double) (a - b) * (a - b);
-                            nn += (double) b * b;
-                        }
-                        if (isnan_) ++nan_slots;
-                        else if (std::sqrt(dd / std::max(nn, 1e-30)) > 0.05) ++bad;
-                        if (j < 3 || (isnan_ && nan_slots <= 3))
-                            std::fprintf(stderr, "  slot %lld (expert %d): rel %.3e nan %d gpu %g %g cpu %g %g%c", (long long) j, hb_ids_[(size_t) j],
-                                         std::sqrt(dd / std::max(nn, 1e-30)), (int) isnan_, dn[(size_t) j * E], dn[(size_t) j * E + 1],
-                                         hb_dn_[(size_t) j * E], hb_dn_[(size_t) j * E + 1], 10);
-                    }
-                    std::fprintf(stderr, "  slots: %lld, non-finite %lld, off by > 5%% %lld%c", (long long) SK, (long long) nan_slots, (long long) bad, 10);
                 }
                 add_rows_kernel<<<nb(TE), TB>>>(MOE, SH, TE);
                 add_rows_kernel<<<nb(TE), TB>>>(X, MOE, TE);
