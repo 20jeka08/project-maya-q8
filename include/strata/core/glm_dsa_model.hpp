@@ -155,6 +155,13 @@ private:
     bool build_graphs(std::string& err);
     const DevW& W(int il, const char* suffix) const;
     bool moe_cpu(int il, const std::vector<int>& ids, const std::vector<float>& rw, std::string& err);
+    // the int8 cache of layer il (glm_dsa_kv.cuh): codes, FP16 scales; the FP16 indexer keys of a full layer
+    int8_t* kv_q(int il) const;
+    void* kv_s(int il) const;
+    void* ik_keys(int il) const;
+    bool select_cells(int il, int n_vis, const float* iq, const float* iw, float* score, std::string& err);
+    bool attend_one(int il, int n_sel, bool sparse, bool blas, const float* q, float* qabs, float* o, void* stream,
+                    std::string& err);
     // the batched path (src/core/glm_dsa_prefill.cu)
     bool pf_alloc(std::string& err);
     bool prefill_chunk(const int32_t* toks, int T, bool head, std::string& err);
@@ -167,10 +174,9 @@ private:
     bool moe_gpu_batch(int il, int T, const float* XN, const float* RW, const int* ids, float* out_dev, std::string& err);
     // decode on the batched path's kernels: the indexer's scores and the attention as GEMMs over every visible
     // cell (all heads at once), the top_k selection as a mask (STRATA_GLM_DECODE_BLAS=0: the per-head kernels)
-    bool decode_index_scores(const float* ik, const float* iq, const float* iw, float* score, int n_vis, std::string& err);
+    bool decode_index_scores(const void* ik16, const float* iq, const float* iw, float* score, int n_vis, std::string& err);
     bool decode_attend(const float* cache, int p, const float* q, float* qabs, float* o, const float* vb, bool masked,
                        std::string& err);
-    bool decode_mask(const std::vector<int>& cells, int n_vis, std::string& err);
 
     GlmDsaGeometry g_;
     int dev_ = 0;
@@ -183,8 +189,12 @@ private:
     const strata::GgufFile* tok_embd_file_ = nullptr;
 
     // device state
-    float* cache_ = nullptr;      ///< per layer: max_ctx x cache_row
-    float* ikeys_ = nullptr;      ///< per FULL indexer layer: max_ctx x idx_key
+    // the attention cache in int8 (src/core/glm_dsa_kv.cuh): per layer int8 [max_ctx x cache_row] and FP16 scales
+    // [max_ctx x cache_row/32]; the indexer's keys FP16 [max_ctx x idx_key] per FULL indexer layer
+    int8_t* kvq_ = nullptr;
+    void* kvs_ = nullptr;
+    void* ikeys_ = nullptr;
+    float* kvg_ = nullptr;        ///< up to top_k cache rows dequantized (decode past the small kernel; short prefill)
     std::vector<int64_t> ik_slot_;
     float* sc_ = nullptr;         ///< scratch arena
     void* q8_ = nullptr;          ///< the Q8_1 activation scratch
@@ -208,9 +218,12 @@ private:
     float* deq_ = nullptr;         ///< one weight expanded to F32
     size_t deq_floats_ = 0;
     float* att_ = nullptr;         ///< attention / indexer score blocks
-    float* pf_score_ = nullptr;    ///< the indexer's per-query scores (chunk x max_ctx)
-    uint8_t* d_mask_ = nullptr;    ///< the selection, chunk x max_ctx (1 = attended)
-    std::vector<uint8_t> h_mask_;
+    float* pf_score_ = nullptr;    ///< the indexer's scores of a block of queries (pf_sub_ x max_ctx)
+    int pf_dsub_ = 0, pf_ssub_ = 0;  ///< query blocks: dense attention (<= top_k cells), sparse attention
+    float *sg_ = nullptr, *ss_ = nullptr, *qc_ = nullptr;   ///< sparse attention: gathered rows, scores, q
+    int *d_sel_ = nullptr, *d_cnt_ = nullptr;   ///< the chunk's selections (chunk x top_k, -1 padded) and counts
+    void* iq16_ = nullptr;         ///< the indexer's queries in FP16 (chunk x idx_heads x idx_key)
+    std::vector<int> h_sel_, h_cnt_;
     std::vector<float> hb_x_, hb_ff_, hb_dn_, hb_moe_, hb_rw_, hb_score_;
     std::vector<int> hb_ids_;
     std::vector<uint8_t> hb_act_, hb_hq_;

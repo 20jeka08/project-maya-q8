@@ -8,6 +8,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/router_sigmoid.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "glm_dsa_kv.cuh"
 
 #include "ggml.h"
 
@@ -403,12 +404,13 @@ void GlmCpuPool::run(int n, const std::function<void(int)>& fn) {
 // ================================ the model ================================
 
 GlmDsaModel::~GlmDsaModel() {
-    if (!allocs_.empty() || cache_) cudaSetDevice(dev_);
+    if (!allocs_.empty()) cudaSetDevice(dev_);
     for (auto* v : {&gA_, &gB_, &gS_, &gC_})
         for (void* e : *v)
             if (e) cudaGraphExecDestroy((cudaGraphExec_t) e);
     if (gstream_) cudaStreamDestroy((cudaStream_t) gstream_);
     if (pin_) cudaFreeHost(pin_);
+    gpu_moe_release();
     if (cublas_) cublasDestroy((cublasHandle_t) cublas_);
     for (void* p : allocs_) cudaFree(p);
     for (auto& e : experts_) delete (strata::kernels::cpu::NativeFmt*) e.fmt;
@@ -583,14 +585,19 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
     }
 
     // 5. the caches and the scratch
-    const size_t cache_floats = (size_t) g.n_layers * (size_t) max_ctx * (size_t) g.cache_row();
-    GD_CHECK(cudaMalloc(&cache_, cache_floats * sizeof(float)));
-    allocs_.push_back(cache_);
+    // the attention cache in int8 (glm_dsa_kv.cuh): 612 bytes a token a layer instead of 2304
+    const size_t cells = (size_t) g.n_layers * (size_t) max_ctx;
+    GD_CHECK(cudaMalloc(&kvq_, cells * (size_t) g.cache_row()));
+    allocs_.push_back(kvq_);
+    GD_CHECK(cudaMalloc(&kvs_, cells * (size_t) (g.cache_row() / kv::kBlock) * sizeof(__half)));
+    allocs_.push_back(kvs_);
+    GD_CHECK(cudaMalloc(&kvg_, (size_t) std::max(g.idx_top_k, 1) * g.cache_row() * sizeof(float)));
+    allocs_.push_back(kvg_);
     ik_slot_.assign((size_t) g.n_layers, -1);
     int64_t n_full = 0;
     for (int il = 0; il < g.n_layers; ++il)
         if (g.indexer_full[(size_t) il]) ik_slot_[(size_t) il] = n_full++;
-    GD_CHECK(cudaMalloc(&ikeys_, (size_t) n_full * (size_t) max_ctx * (size_t) g.idx_key * sizeof(float)));
+    GD_CHECK(cudaMalloc(&ikeys_, std::max<size_t>(1, (size_t) n_full * (size_t) max_ctx * (size_t) g.idx_key) * sizeof(__half)));
     allocs_.push_back(ikeys_);
     const size_t scratch = (size_t) 16 * g.n_embd + (size_t) 4 * g.n_head * g.qk_head() +
                            (size_t) 2 * g.n_head * g.kv_lora + (size_t) 4 * g.n_ff_dense +
@@ -799,7 +806,6 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
 
     prof(7);
     for (int il = 0; il < g.n_layers; ++il) {
-        float* cache = cache_ + (size_t) il * (size_t) max_ctx_ * g.cache_row();
         // ---- attention
         rms_norm_kernel<<<1, T_>>>(x, (const float*) W(il, "attn_norm.weight").d, xn, g.n_embd, g.norm_eps);
         if (!gemv(W(il, "attn_q_a.weight"), xn, qr, err)) return false;
@@ -808,46 +814,24 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
         rms_norm_kernel<<<1, T_>>>(kvpe, (const float*) W(il, "attn_kv_a_norm.weight").d, kvpe, g.kv_lora,
                                    g.norm_eps);
         rope_norm_kernel<<<nblk(g.qk_rope / 2), T_>>>(kvpe, 1, g.cache_row(), g.kv_lora, g.qk_rope, p, theta_scale);
-        GD_CHECK(cudaMemcpy(cache + (size_t) p * g.cache_row(), kvpe, (size_t) g.cache_row() * sizeof(float),
-                            cudaMemcpyDeviceToDevice));
+        kv::store_q8(kvpe, 1, g.cache_row(), g.cache_row(), kv_q(il), (__half*) kv_s(il), p, nullptr, nullptr);
 
         // the lightning indexer: keys are cached on full layers; the selection matters only past top_k cells
         prof(0);
         if (g.indexer_full[(size_t) il]) {
-            float* ik = ikeys_ + (size_t) ik_slot_[(size_t) il] * (size_t) max_ctx_ * g.idx_key;
-            float* ikp = ik + (size_t) p * g.idx_key;
-            if (!gemv(W(il, "indexer.attn_k.weight"), xn, ikp, err)) return false;
-            layer_norm_kernel<<<1, 128>>>(ikp, (const float*) W(il, "indexer.k_norm.weight").d,
-                                          (const float*) W(il, "indexer.k_norm.bias").d, ikp, g.idx_key,
+            if (!gemv(W(il, "indexer.attn_k.weight"), xn, ikv_, err)) return false;
+            layer_norm_kernel<<<1, 128>>>(ikv_, (const float*) W(il, "indexer.k_norm.weight").d,
+                                          (const float*) W(il, "indexer.k_norm.bias").d, ikv_, g.idx_key,
                                           g.idx_norm_eps);
-            rope_norm_kernel<<<nblk(g.qk_rope / 2), T_>>>(ikp, 1, g.idx_key, 0, g.qk_rope, p, theta_scale);
+            rope_norm_kernel<<<nblk(g.qk_rope / 2), T_>>>(ikv_, 1, g.idx_key, 0, g.qk_rope, p, theta_scale);
+            kv::store_f16(ikv_, 1, g.idx_key, g.idx_key, (__half*) ik_keys(il), p, nullptr, nullptr);
             if (n_vis > g.idx_top_k) {
                 if (!gemv(W(il, "indexer.attn_q_b.weight"), qr, iq, err)) return false;
                 rope_norm_kernel<<<nblk(g.idx_heads * g.qk_rope / 2), T_>>>(iq, g.idx_heads, g.idx_key, 0, g.qk_rope,
                                                                             p, theta_scale);
                 if (!gemv(W(il, "indexer.proj.weight"), xn, iw, err)) return false;
                 scale_kernel<<<1, T_>>>(iw, 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads)), g.idx_heads);
-                const size_t smem = (size_t) (g.idx_heads * g.idx_key + g.idx_heads) * sizeof(float);
-                if (dec_blas) {
-                    if (!decode_index_scores(ik, iq, iw, score, n_vis, err)) return false;
-                } else {
-                    indexer_score_kernel<<<nblk(n_vis), T_, smem>>>(iq, ik, iw, score, n_vis, g.idx_heads, g.idx_key);
-                }
-                h_score_.resize((size_t) n_vis);
-                GD_CHECK(cudaMemcpy(h_score_.data(), score, (size_t) n_vis * sizeof(float), cudaMemcpyDeviceToHost));
-                cells_.resize((size_t) n_vis);
-                std::iota(cells_.begin(), cells_.end(), 0);
-                std::nth_element(cells_.begin(), cells_.begin() + g.idx_top_k, cells_.end(), [&](int a, int b) {
-                    return h_score_[(size_t) a] > h_score_[(size_t) b] ||
-                           (h_score_[(size_t) a] == h_score_[(size_t) b] && a < b);
-                });
-                cells_.resize((size_t) g.idx_top_k);
-                std::sort(cells_.begin(), cells_.end());
-                if (dec_blas) {
-                    if (!decode_mask(cells_, n_vis, err)) return false;
-                } else {
-                    GD_CHECK(cudaMemcpy(d_cells_, cells_.data(), cells_.size() * sizeof(int), cudaMemcpyHostToDevice));
-                }
+                if (!select_cells(il, n_vis, iq, iw, score, err)) return false;
                 n_sel = g.idx_top_k;
                 sparse = true;
             } else {
@@ -864,14 +848,7 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
         q_absorb_kernel<<<nblk((int64_t) g.n_head * g.kv_lora * 32), T_>>>(
             (const float*) W(il, "attn_k_b.weight").d, q, qabs, g.qk_nope, g.qk_head(), g.kv_lora, g.n_head);
         prof(9);
-        if (dec_blas) {
-            if (!decode_attend(cache, p, q, qabs, o, (const float*) W(il, "attn_v_b.weight").d, sparse, err)) return false;
-        } else {
-            const size_t smem = (size_t) (g.cache_row() + g.kv_lora + 32 + n_sel) * sizeof(float);
-            mla_attn_kernel<<<g.n_head, T_, smem>>>(qabs, q, cache, sparse ? d_cells_ : nullptr, n_sel,
-                                                    (const float*) W(il, "attn_v_b.weight").d, o, g.kv_lora, g.qk_nope,
-                                                    g.qk_rope, g.v_head, kq_scale);
-        }
+        if (!attend_one(il, n_sel, sparse, dec_blas, q, qabs, o, nullptr, err)) return false;
         GD_CHECK(cudaGetLastError());
         prof(2);
         if (!gemv(W(il, "attn_output.weight"), o, tmp, err)) return false;
@@ -939,6 +916,52 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
     t_total_ += total;
     t_cpu_ += cpu_ms;
     t_dev_ += total - cpu_ms;
+    return true;
+}
+
+int8_t* GlmDsaModel::kv_q(int il) const { return kvq_ + (size_t) il * (size_t) max_ctx_ * g_.cache_row(); }
+void* GlmDsaModel::kv_s(int il) const {
+    return (__half*) kvs_ + (size_t) il * (size_t) max_ctx_ * (g_.cache_row() / kv::kBlock);
+}
+void* GlmDsaModel::ik_keys(int il) const {
+    return (__half*) ikeys_ + (size_t) ik_slot_[(size_t) il] * (size_t) max_ctx_ * g_.idx_key;
+}
+
+/// The indexer's selection for one decode token: its scores over the n_vis cached keys, the top_k of them chosen on
+/// the host (ties to the lower cell, as llama.cpp's top_k), ascending, into d_cells_.
+bool GlmDsaModel::select_cells(int il, int n_vis, const float* iq, const float* iw, float* score, std::string& err) {
+    const GlmDsaGeometry& g = g_;
+    if (!decode_index_scores(ik_keys(il), iq, iw, score, n_vis, err)) return false;
+    h_score_.resize((size_t) n_vis);
+    GD_CHECK(cudaMemcpy(h_score_.data(), score, (size_t) n_vis * sizeof(float), cudaMemcpyDeviceToHost));
+    cells_.resize((size_t) n_vis);
+    std::iota(cells_.begin(), cells_.end(), 0);
+    std::nth_element(cells_.begin(), cells_.begin() + g.idx_top_k, cells_.end(), [&](int a, int b) {
+        return h_score_[(size_t) a] > h_score_[(size_t) b] || (h_score_[(size_t) a] == h_score_[(size_t) b] && a < b);
+    });
+    cells_.resize((size_t) g.idx_top_k);
+    std::sort(cells_.begin(), cells_.end());
+    GD_CHECK(cudaMemcpy(d_cells_, cells_.data(), cells_.size() * sizeof(int), cudaMemcpyHostToDevice));
+    return true;
+}
+
+/// One decode token's attention over its n_sel cells of layer il (d_cells_ when sparse, else 0..n_sel-1): the
+/// per-head int8 kernel for a short dense context, else the cells dequantized into kvg_ and the cuBLAS path.
+bool GlmDsaModel::attend_one(int il, int n_sel, bool sparse, bool blas, const float* q, float* qabs, float* o,
+                             void* stream, std::string& err) {
+    const GlmDsaGeometry& g = g_;
+    const float* vb = (const float*) W(il, "attn_v_b.weight").d;
+    if (!blas && !sparse) {
+        kv::attend_small_q8(qabs, q, kv_q(il), (const __half*) kv_s(il), nullptr, n_sel, vb, o, g.n_head, g.kv_lora,
+                            g.qk_nope, g.qk_rope, g.v_head, 1.0f / std::sqrt((float) g.qk_head()),
+                            (cudaStream_t) stream);
+    } else {
+        // (the legacy stream orders after `stream`'s earlier work: both are blocking streams)
+        kv::gather_q8(kv_q(il), (const __half*) kv_s(il), g.cache_row(), sparse ? d_cells_ : nullptr, 0, n_sel, kvg_,
+                      nullptr);
+        if (!decode_attend(kvg_, n_sel - 1, q, qabs, o, vb, false, err)) return false;
+    }
+    GD_CHECK(cudaGetLastError());
     return true;
 }
 
@@ -1062,7 +1085,6 @@ bool GlmDsaModel::build_graphs(std::string& err) {
     gS_.assign((size_t) g.n_layers, nullptr);
     gC_.assign((size_t) g.n_layers, nullptr);
     for (int il = 0; il < g.n_layers; ++il) {
-        float* cache = cache_ + (size_t) il * (size_t) max_ctx_ * g.cache_row();
         const bool full = g.indexer_full[(size_t) il];
         if (!record(gA_[(size_t) il], [&]() -> bool {
                 rms_norm_kernel<<<1, T_, 0, s>>>(x, (const float*) W(il, "attn_norm.weight").d, xn, g.n_embd,
@@ -1075,16 +1097,15 @@ bool GlmDsaModel::build_graphs(std::string& err) {
                                                  g.kv_lora, g.norm_eps);
                 rope_dev_kernel<<<nblk(g.qk_rope / 2), T_, 0, s>>>(kvpe, 1, g.cache_row(), g.kv_lora, g.qk_rope,
                                                                    d_pos_, theta_scale);
-                store_row_kernel<<<nblk(g.cache_row()), T_, 0, s>>>(cache, g.cache_row(), kvpe, d_pos_);
+                kv::store_q8(kvpe, 1, g.cache_row(), g.cache_row(), kv_q(il), (__half*) kv_s(il), 0, d_pos_, s);
                 if (full) {
-                    float* ik = ikeys_ + (size_t) ik_slot_[(size_t) il] * (size_t) max_ctx_ * g.idx_key;
                     if (!gemv_s(W(il, "indexer.attn_k.weight"), xn, ikv_, s, err)) return false;
                     layer_norm_kernel<<<1, 128, 0, s>>>(ikv_, (const float*) W(il, "indexer.k_norm.weight").d,
                                                         (const float*) W(il, "indexer.k_norm.bias").d, ikv_, g.idx_key,
                                                         g.idx_norm_eps);
                     rope_dev_kernel<<<nblk(g.qk_rope / 2), T_, 0, s>>>(ikv_, 1, g.idx_key, 0, g.qk_rope, d_pos_,
                                                                        theta_scale);
-                    store_row_kernel<<<nblk(g.idx_key), T_, 0, s>>>(ik, g.idx_key, ikv_, d_pos_);
+                    kv::store_f16(ikv_, 1, g.idx_key, g.idx_key, (__half*) ik_keys(il), 0, d_pos_, s);
                     // the query side of the selection: cheap (2 small GEMVs), so always computed and the graph
                     // stays one shape; it is read only past top_k cells
                     if (!gemv_s(W(il, "indexer.attn_q_b.weight"), qr, iq, s, err)) return false;
@@ -1199,34 +1220,12 @@ bool GlmDsaModel::step_graph(int32_t token, float* logits, std::string& err, boo
     std::vector<float> v_rw((size_t) g.n_exp_used);
 
     for (int il = 0; il < g.n_layers; ++il) {
-        const float* cache = cache_ + (size_t) il * (size_t) max_ctx_ * g.cache_row();
         GD_CHECK(cudaGraphLaunch((cudaGraphExec_t) gA_[(size_t) il], s));
         if (g.indexer_full[(size_t) il]) {
             if (n_vis > g.idx_top_k) {
                 // the selection: the scores on the device, the top_k on the host (as step does)
-                const float* ik = ikeys_ + (size_t) ik_slot_[(size_t) il] * (size_t) max_ctx_ * g.idx_key;
                 GD_CHECK(cudaStreamSynchronize(s));
-                if (dec_blas) {
-                    if (!decode_index_scores(ik, iq, iw, score, n_vis, err)) return false;
-                } else {
-                    const size_t smem = (size_t) (g.idx_heads * g.idx_key + g.idx_heads) * sizeof(float);
-                    indexer_score_kernel<<<nblk(n_vis), T_, smem>>>(iq, ik, iw, score, n_vis, g.idx_heads, g.idx_key);
-                }
-                h_score_.resize((size_t) n_vis);
-                GD_CHECK(cudaMemcpy(h_score_.data(), score, (size_t) n_vis * sizeof(float), cudaMemcpyDeviceToHost));
-                cells_.resize((size_t) n_vis);
-                std::iota(cells_.begin(), cells_.end(), 0);
-                std::nth_element(cells_.begin(), cells_.begin() + g.idx_top_k, cells_.end(), [&](int a, int b) {
-                    return h_score_[(size_t) a] > h_score_[(size_t) b] ||
-                           (h_score_[(size_t) a] == h_score_[(size_t) b] && a < b);
-                });
-                cells_.resize((size_t) g.idx_top_k);
-                std::sort(cells_.begin(), cells_.end());
-                if (dec_blas) {
-                    if (!decode_mask(cells_, n_vis, err)) return false;
-                } else {
-                    GD_CHECK(cudaMemcpy(d_cells_, cells_.data(), cells_.size() * sizeof(int), cudaMemcpyHostToDevice));
-                }
+                if (!select_cells(il, n_vis, iq, iw, score, err)) return false;
                 n_sel = g.idx_top_k;
                 sparse = true;
             } else {
@@ -1234,17 +1233,8 @@ bool GlmDsaModel::step_graph(int32_t token, float* logits, std::string& err, boo
                 sparse = false;
             }
         }
-        // the attention (its size changes every token): on the legacy stream, which orders against `s`
-        if (dec_blas) {
-            if (!decode_attend(cache, p, q, qabs, o, (const float*) W(il, "attn_v_b.weight").d, sparse, err))
-                return false;
-        } else {
-            const size_t smem = (size_t) (g.cache_row() + g.kv_lora + 32 + n_sel) * sizeof(float);
-            mla_attn_kernel<<<g.n_head, T_, smem, s>>>(qabs, q, cache, sparse ? d_cells_ : nullptr, n_sel,
-                                                      (const float*) W(il, "attn_v_b.weight").d, o, g.kv_lora,
-                                                      g.qk_nope, g.qk_rope, g.v_head, kq_scale);
-        }
-        GD_CHECK(cudaGetLastError());
+        // the attention (its size changes every token): outside the graphs
+        if (!attend_one(il, n_sel, sparse, dec_blas, q, qabs, o, s, err)) return false;
         GD_CHECK(cudaGraphLaunch((cudaGraphExec_t) gB_[(size_t) il], s));
         if (il < g.dense_lead) continue;
         GD_CHECK(cudaStreamSynchronize(s));   // the route and the activation are in pinned memory now
