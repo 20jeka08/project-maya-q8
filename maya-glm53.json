@@ -4,7 +4,7 @@
   "--model",
   "E:\\.lmstudio\\models\\unsloth\\GLM-5.3-GGUF\\GLM-5.3-UD-Q4_K_XL-00001-of-00011.gguf",
   "--max-context",
-  "16384"
+  "393216"
  ],
  "env": {
   "STRATA_GLM_THREADS": "48"
