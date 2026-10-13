@@ -186,7 +186,9 @@ const strata::kernels::cpu::NativeFmt& fmt_of(void* p) { return *(const strata::
 bool GlmDsaModel::pf_alloc(std::string& err) {
     if (pf_) return true;
     const GlmDsaGeometry& g = g_;
-    int T = 512;
+    // chunks of 512 tokens; 2048 when the experts may run on the GPU (its weight transfer is per chunk: 3268-token
+    // prompt, RTX 5090: 1024 -> 83 s, 2048 -> 54 s)
+    int T = gpu_moe_enabled() ? 2048 : 512;
     if (const char* s = std::getenv("STRATA_GLM_CHUNK")) T = std::max(1, std::atoi(s));
     pf_chunk_ = T;
     cublasHandle_t h = nullptr;
@@ -534,6 +536,63 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
             PF_CUDA(cudaMemcpy(hb_ids_.data(), IDS, kk * sizeof(int), cudaMemcpyDeviceToHost));
             PF_CUDA(cudaMemcpy(hb_rw_.data(), RW, kk * sizeof(float), cudaMemcpyDeviceToHost));
             route_log(il, hb_ids_.data(), T);
+            // a long chunk's experts on the GPU (STRATA_GLM_GPU_MOE_MIN tokens, 512: below it the CPU is as fast -
+            // the GPU's cost is the weight transfer, the same for any chunk length)
+            static const int gpu_min = std::getenv("STRATA_GLM_GPU_MOE_MIN") ? std::atoi(std::getenv("STRATA_GLM_GPU_MOE_MIN")) : 512;
+            if (gpu_moe_enabled() && T >= gpu_min) {
+                const int FS = g.n_ff_exp * g.n_shared;
+                if (!gemm(W(il, "ffn_gate_shexp.weight"), XN, GA, T, err) ||
+                    !gemm(W(il, "ffn_up_shexp.weight"), XN, UP, T, err))
+                    return false;
+                strata::kernels::glm_swiglu_clamp(GA, UP, INFINITY, (int64_t) T * FS, HH, nullptr);
+                if (!gemm(W(il, "ffn_down_shexp.weight"), HH, SH, T, err)) return false;
+                if (!moe_gpu_batch(il, T, XN, RW, hb_ids_.data(), MOE, err)) return false;
+                // STRATA_GLM_GPU_MOE_CHECK=1: the CPU path on the same input, the relative difference printed
+                static const bool chk = std::getenv("STRATA_GLM_GPU_MOE_CHECK") && std::atoi(std::getenv("STRATA_GLM_GPU_MOE_CHECK"));
+                if (chk) {
+                    PF_CUDA(cudaMemcpy(hb_x_.data(), XN, (size_t) TE * sizeof(float), cudaMemcpyDeviceToHost));
+                    if (!moe_cpu_batch(il, T, hb_ids_.data(), hb_rw_.data(), err)) return false;
+                    std::vector<float> gpu((size_t) TE);
+                    PF_CUDA(cudaMemcpy(gpu.data(), MOE, (size_t) TE * sizeof(float), cudaMemcpyDeviceToHost));
+                    double d = 0, n = 0, d0 = 0, n0 = 0;
+                    for (int64_t i = 0; i < TE; ++i) {
+                        d += (double) (gpu[i] - hb_moe_[i]) * (gpu[i] - hb_moe_[i]);
+                        n += (double) hb_moe_[i] * hb_moe_[i];
+                        if (i < E) d0 += (double) (gpu[i] - hb_moe_[i]) * (gpu[i] - hb_moe_[i]), n0 += (double) hb_moe_[i] * hb_moe_[i];
+                    }
+                    std::fprintf(stderr, "gpu-moe check L%d: rel diff %.3e (token 0: %.3e), |cpu| %.3e, gpu[0..3] %g %g %g cpu %g %g %g", il,
+                                 std::sqrt(d / std::max(n, 1e-30)), std::sqrt(d0 / std::max(n0, 1e-30)), std::sqrt(n), gpu[0], gpu[1], gpu[2],
+                                 hb_moe_[0], hb_moe_[1], hb_moe_[2]);
+                    std::fputc(10, stderr);
+                    // per (token, slot): the GPU's down rows against the CPU's
+                    const int64_t SK = (int64_t) T * g.n_exp_used;
+                    std::vector<float> dn((size_t) SK * E);
+                    PF_CUDA(cudaMemcpy(dn.data(), gm_dn_, dn.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                    int64_t nan_slots = 0, bad = 0;
+                    for (int64_t j = 0; j < SK; ++j) {
+                        double dd = 0, nn = 0;
+                        bool isnan_ = false;
+                        for (int e = 0; e < E; ++e) {
+                            const float a = dn[(size_t) j * E + e], b = hb_dn_[(size_t) j * E + e];
+                            if (!std::isfinite(a)) isnan_ = true;
+                            dd += (double) (a - b) * (a - b);
+                            nn += (double) b * b;
+                        }
+                        if (isnan_) ++nan_slots;
+                        else if (std::sqrt(dd / std::max(nn, 1e-30)) > 0.05) ++bad;
+                        if (j < 3 || (isnan_ && nan_slots <= 3))
+                            std::fprintf(stderr, "  slot %lld (expert %d): rel %.3e nan %d gpu %g %g cpu %g %g%c", (long long) j, hb_ids_[(size_t) j],
+                                         std::sqrt(dd / std::max(nn, 1e-30)), (int) isnan_, dn[(size_t) j * E], dn[(size_t) j * E + 1],
+                                         hb_dn_[(size_t) j * E], hb_dn_[(size_t) j * E + 1], 10);
+                    }
+                    std::fprintf(stderr, "  slots: %lld, non-finite %lld, off by > 5%% %lld%c", (long long) SK, (long long) nan_slots, (long long) bad, 10);
+                }
+                add_rows_kernel<<<nb(TE), TB>>>(MOE, SH, TE);
+                add_rows_kernel<<<nb(TE), TB>>>(X, MOE, TE);
+                PF_CUDA(cudaGetLastError());
+                capture(il, 1, X + (size_t) (T - 1) * E);
+                continue;
+            }
             PF_CUDA(cudaMemcpy(hb_x_.data(), XN, (size_t) TE * sizeof(float), cudaMemcpyDeviceToHost));
             capture_ids(il, hb_ids_.data() + (size_t) (T - 1) * g.n_exp_used, hb_rw_.data() + (size_t) (T - 1) * g.n_exp_used);
             // the shared expert on the device while the CPU runs the routed ones

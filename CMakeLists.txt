@@ -317,7 +317,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu
-    src/core/glm_dsa_model.cu src/core/glm_dsa_prefill.cu)
+    src/core/glm_dsa_model.cu src/core/glm_dsa_prefill.cu src/core/glm_dsa_gpu_moe.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
@@ -357,6 +357,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(glm_dsa_run PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_dsa_run PRIVATE strata_engine strata_prefill ${_strata_gpu_runtime_target})
   add_executable(glm_dsa_moe_bench src/program/glm_dsa_moe_bench.cpp)
+  add_executable(glm_dsa_pcie_bench src/program/glm_dsa_pcie_bench.cpp)
+  target_link_libraries(glm_dsa_pcie_bench PRIVATE strata_engine ${_strata_gpu_runtime_target})
   target_link_libraries(glm_dsa_moe_bench PRIVATE strata_engine ${_strata_gpu_runtime_target})
 
   if(STRATA_ENABLE_HIP)

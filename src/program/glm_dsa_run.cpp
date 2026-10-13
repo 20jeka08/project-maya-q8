@@ -420,6 +420,18 @@ int main(int argc, char** argv) {
     double nll = 0;
     int n_nll = 0;
     if (batched && !eval) {   // the prompt through the batched path, then the head of its last token
+        // STRATA_GLM_PREFILL_TWICE=1: read it once first (a server's first long prompt locks the experts' pages),
+        // then time the second read
+        if (std::getenv("STRATA_GLM_PREFILL_TWICE") && std::atoi(std::getenv("STRATA_GLM_PREFILL_TWICE"))) {
+            const auto w0 = std::chrono::steady_clock::now();
+            if (!m.prefill(toks.data(), (int64_t) toks.size(), err, true)) {
+                std::fprintf(stderr, "prefill failed: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "prefill (first, pages locking): %zu tokens in %.0f ms\n", toks.size(),
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+            m.reset();
+        }
         const auto t0 = std::chrono::steady_clock::now();
         if (!m.prefill(toks.data(), (int64_t) toks.size(), err, true) || !m.read_logits(logits.data(), err)) {
             std::fprintf(stderr, "prefill failed: %s\n", err.c_str());

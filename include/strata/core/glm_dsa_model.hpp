@@ -160,6 +160,11 @@ private:
     bool prefill_chunk(const int32_t* toks, int T, bool head, std::string& err);
     bool gemm(const DevW& w, const float* X, float* Y, int T, std::string& err);
     bool moe_cpu_batch(int il, int T, const int* ids, const float* rw, std::string& err);
+    // the batched path's experts on the GPU (src/core/glm_dsa_gpu_moe.cu)
+    bool gpu_moe_enabled() const;
+    void gpu_moe_release();
+    bool gpu_moe_alloc(int Tmax, std::string& err);
+    bool moe_gpu_batch(int il, int T, const float* XN, const float* RW, const int* ids, float* out_dev, std::string& err);
     // decode on the batched path's kernels: the indexer's scores and the attention as GEMMs over every visible
     // cell (all heads at once), the top_k selection as a mask (STRATA_GLM_DECODE_BLAS=0: the per-head kernels)
     bool decode_index_scores(const float* ik, const float* iq, const float* iw, float* score, int n_vis, std::string& err);
@@ -241,6 +246,19 @@ private:
     // the graph decode: a stream, per layer A (attention inputs), B (out-proj .. router), S (shared expert),
     // C (the routed result back + residual); pinned host words; the position on the device
     void* gstream_ = nullptr;
+    // GPU experts: two group buffers, their events, the copy stream, MMQ's context, the row tables
+    int gm_tmax_ = 0, gm_group_ = 0;
+    size_t gm_stride_ = 0;
+    void* gm_w_[2] = {};
+    void* gm_ready_[2] = {};
+    void* gm_free_[2] = {};
+    void* gm_copy_ = nullptr;
+    void* gm_ctx_ = nullptr;
+    int *gm_bounds_ = nullptr, *gm_row_tok_ = nullptr, *gm_row_slot_ = nullptr, *gm_iota_ = nullptr;
+    void *gm_xq_ = nullptr, *gm_hq_ = nullptr;
+    float *gm_gu_ = nullptr, *gm_h_ = nullptr, *gm_dn_ = nullptr;
+    bool gm_registered_ = false;
+    std::vector<void*> gm_regs_;
     std::vector<void*> gA_, gB_, gS_, gC_;
     float* pin_ = nullptr;          ///< pinned: [rw 64 | ids 64 | x n_embd | moe n_embd | embd n_embd | pos 64]
     int* d_pos_ = nullptr;
