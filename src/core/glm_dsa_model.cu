@@ -14,6 +14,14 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -413,7 +421,10 @@ GlmDsaModel::~GlmDsaModel() {
     gpu_moe_release();
     if (cublas_) cublasDestroy((cublasHandle_t) cublas_);
     for (void* p : allocs_) cudaFree(p);
-    for (auto& e : experts_) delete (strata::kernels::cpu::NativeFmt*) e.fmt;
+    for (auto& e : experts_) {
+        delete (strata::kernels::cpu::NativeFmt*) e.fmt;
+        if (e.pinned) cudaFreeHost(e.pinned);
+    }
 }
 
 const strata::TensorInfo* GlmDsaModel::find(const std::string& name, const strata::GgufFile** file) const {
@@ -803,7 +814,65 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
     h_hq_.resize((size_t) g.n_exp_used * strata::kernels::cpu::kNativeHBytes);
     h_embd_.resize((size_t) g.n_embd);
 
-    // 6. warm the routed experts: every page read once, in parallel.  Decode touches ~600 random experts a token;
+    // 6. the pinned RAM tier (Maya's): whole layers' experts copied into page-locked memory, one piece a layer, as
+    //    many as the driver allows up to STRATA_GLM_PIN_GB (250; 0: none) - the long-prompt GPU lanes then DMA them
+    //    at full PCIe speed (glm_dsa_pcie_bench: 258 GB pinnable here in 8 GiB pieces, 50.1 GB/s into both cards)
+    //    against ~13 GB/s from the memory map, and decode's CPU reads them in place (the map's pages of those
+    //    layers fall out of the cache).  Only when the GPU experts are on: a long prompt is what it is for.
+    {
+        double pin_gb = 200;
+        if (const char* e = std::getenv("STRATA_GLM_PIN_GB")) pin_gb = std::atof(e);
+        if (std::getenv("STRATA_GLM_GPU_MOE") && std::atoi(std::getenv("STRATA_GLM_GPU_MOE")) == 0) pin_gb = 0;
+        double pinned = 0;
+        const auto p0 = std::chrono::steady_clock::now();
+        GD_CHECK(cudaSetDevice(dev_));
+        for (int il = g.dense_lead; il < (int) experts_.size() && pin_gb > 0; ++il) {
+            ExpertLayer& e = experts_[(size_t) il];
+            if (!e.fmt) continue;
+            const size_t gb = e.gu_expert * (size_t) g.n_expert, db = e.d_expert * (size_t) g.n_expert;
+            const size_t bytes = 2 * gb + db;
+            if (pinned + bytes / 1e9 > pin_gb) break;
+            uint8_t* p = nullptr;
+            if (cudaHostAlloc((void**) &p, bytes, cudaHostAllocPortable) != cudaSuccess) {
+                cudaGetLastError();
+                break;   // the driver's cap
+            }
+            const uint8_t* src[3] = {e.gate, e.up, e.down};
+            const size_t off[3] = {0, gb, 2 * gb}, len[3] = {gb, gb, db};
+            constexpr size_t CH = (size_t) 64 << 20;
+            std::vector<std::pair<int, size_t>> jobs;
+            for (int k = 0; k < 3; ++k)
+                for (size_t o = 0; o < len[k]; o += CH) jobs.push_back({k, o});
+            pool_->run((int) jobs.size(), [&](int j) {
+                const int k = jobs[(size_t) j].first;
+                const size_t o = jobs[(size_t) j].second;
+                std::memcpy(p + off[k] + o, src[k] + o, std::min(CH, len[k] - o));
+            });
+            // the map's pages of this layer out of our working set (to the standby list): copied, they were held twice -
+            // 120 GB pinned + 120 GB still mapped + the 320 GB of the other layers is more than this box's 512 GB, and
+            // decode's experts were paged out (CPU part 145 -> 587 ms a token)
+            for (int k = 0; k < 3; ++k) {
+                const uintptr_t a = (uintptr_t) src[k] & ~(uintptr_t) 4095;
+                const size_t n = (size_t) ((uintptr_t) src[k] + len[k] - a);
+#ifdef _WIN32
+                VirtualUnlock((void*) a, n);   // (on pages that are not locked: removes them from the working set)
+#else
+                madvise((void*) a, n, MADV_DONTNEED);
+#endif
+            }
+            e.pinned = p;
+            e.gate = p;
+            e.up = p + gb;
+            e.down = p + 2 * gb;
+            pinned += bytes / 1e9;
+            ++pinned_layers_;
+        }
+        if (pinned_layers_ > 0)
+            std::fprintf(stderr, "glm-dsa: pinned RAM tier: %d layers' experts (%.0f GB) in %.0f s\n", pinned_layers_,
+                         pinned, std::chrono::duration<double>(std::chrono::steady_clock::now() - p0).count());
+    }
+
+    // 7. warm the routed experts: every page read once, in parallel.  Decode touches ~600 random experts a token;
     //    a page that is not resident costs a disk read, and one resident in the file cache but not yet mapped
     //    into this process costs a soft fault - measured 340-1500 ms a token against 138 ms once all of them are
     //    mapped (glm_dsa_moe_bench, EPYC 7K62 8x DDR4-2933: 99.6 GB/s).  STRATA_GLM_WARM=0 skips it.
@@ -817,7 +886,7 @@ bool GlmDsaModel::load(const std::string& gguf_path, int64_t max_ctx, int dev, s
         constexpr size_t CH = (size_t) 64 << 20;
         size_t total = 0;
         for (const ExpertLayer& e : experts_) {
-            if (!e.fmt) continue;
+            if (!e.fmt || e.pinned) continue;   // (the pinned tier is resident by construction)
             const size_t gb = e.gu_expert * (size_t) g.n_expert, db = e.d_expert * (size_t) g.n_expert;
             const Span whole[3] = {{e.gate, gb}, {e.up, gb}, {e.down, db}};
             for (const Span& w : whole)
@@ -1125,13 +1194,13 @@ void GlmDsaModel::bind(int i) {
     if (cur_ >= 0) {   // stash what the current part allocated since it was bound
         Part& o = parts_[(size_t) cur_];
         o.sc = sc_, o.q8 = q8_, o.d_cells = d_cells_, o.kvg = kvg_, o.ikv = ikv_, o.cublas = cublas_;
-        o.pf = pf_, o.deq = deq_, o.att = att_, o.pf_score = pf_score_, o.sg = sg_, o.ss = ss_, o.qc = qc_;
+        o.pf = pf_, o.pfc = pfc_, o.deq = deq_, o.att = att_, o.pf_score = pf_score_, o.sg = sg_, o.ss = ss_, o.qc = qc_;
         o.d_sel = d_sel_, o.d_cnt = d_cnt_, o.iq16 = iq16_, o.gstream = gstream_, o.pin = pin_, o.d_pos = d_pos_;
         o.dq_ctx = dq_ctx_, o.dq_xq = dq_xq_, o.dq_bounds = dq_bounds_, o.dq_iota = dq_iota_;
     }
     const Part& p = parts_[(size_t) i];
     sc_ = p.sc, q8_ = p.q8, d_cells_ = p.d_cells, kvg_ = p.kvg, ikv_ = p.ikv, cublas_ = p.cublas;
-    pf_ = p.pf, deq_ = p.deq, att_ = p.att, pf_score_ = p.pf_score, sg_ = p.sg, ss_ = p.ss, qc_ = p.qc;
+    pf_ = p.pf, pfc_ = p.pfc, deq_ = p.deq, att_ = p.att, pf_score_ = p.pf_score, sg_ = p.sg, ss_ = p.ss, qc_ = p.qc;
     d_sel_ = p.d_sel, d_cnt_ = p.d_cnt, iq16_ = p.iq16, gstream_ = p.gstream, pin_ = p.pin, d_pos_ = p.d_pos;
     dq_ctx_ = p.dq_ctx, dq_xq_ = p.dq_xq, dq_bounds_ = p.dq_bounds, dq_iota_ = p.dq_iota;
     cur_ = i;

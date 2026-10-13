@@ -61,6 +61,18 @@ __global__ void moe_combine_kernel(const float* __restrict__ dn, const float* __
     out[i] = acc;
 }
 
+/// out[t, :] += rw[j] * dn[r, :] for the group's rows r (slot j = row_slot[r], token t = j / k_used).  Atomic: two
+/// slots of one token can sit in one group (two of its experts), and float addition order then varies by ~1e-7.
+__global__ void group_combine_kernel(const float* __restrict__ dn, const int* __restrict__ row_slot,
+                                     const float* __restrict__ rw, float* __restrict__ out, int nrows, int k_used,
+                                     int E) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t) nrows * E) return;
+    const int r = (int) (i / E), e = (int) (i % E);
+    const int j = row_slot[r];
+    atomicAdd(&out[(size_t) (j / k_used) * E + e], rw[j] * dn[i]);
+}
+
 __global__ void add_into_kernel(float* __restrict__ y, const float* __restrict__ a, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] += a[i];
@@ -87,6 +99,7 @@ struct GmLane {
 struct GmState {
     std::vector<GmLane> lanes;
     int tmax = 0, group = 16;
+    int rcap = 16384;               ///< the most (token, slot) rows one group multiplies (its buffers' size)
     size_t stride = 0;
 };
 
@@ -124,6 +137,11 @@ bool GlmDsaModel::gpu_moe_alloc(int Tmax, std::string& err) {
     if (st && st->tmax >= Tmax) return true;
     const int64_t rows = (int64_t) Tmax * g.n_exp_used;
     const int64_t F = g.n_ff_exp, E = g.n_embd;
+    // a group's buffers hold at most rcap rows (STRATA_GLM_GPU_ROWS, 16384): a chunk of 8192 tokens has 65,536
+    // (token, slot) rows, and buffers for all of them were ~3.7 GB a lane
+    int64_t rcap = 16384;
+    if (const char* r = std::getenv("STRATA_GLM_GPU_ROWS")) rcap = std::max<int64_t>(256, std::atoll(r));
+    rcap = std::min<int64_t>(rcap, rows);
     if (!st) {
         st = new GmState();
         gm_ = st;
@@ -191,11 +209,11 @@ bool GlmDsaModel::gpu_moe_alloc(int Tmax, std::string& err) {
         ok = ok && (L.row_tok = (int*) alloc(rows * sizeof(int))) != nullptr;
         ok = ok && (L.row_slot = (int*) alloc(rows * sizeof(int))) != nullptr;
         ok = ok && (L.iota = (int*) alloc(rows * sizeof(int))) != nullptr;
-        ok = ok && (L.xq = alloc(mmq::q8_bytes(rows, E))) != nullptr;
-        ok = ok && (L.hq = alloc(mmq::q8_bytes(rows, F))) != nullptr;
-        ok = ok && (L.gu = (float*) alloc((size_t) rows * 2 * F * sizeof(float))) != nullptr;
-        ok = ok && (L.h = (float*) alloc((size_t) rows * F * sizeof(float))) != nullptr;
-        ok = ok && (L.dn = (float*) alloc((size_t) rows * E * sizeof(float))) != nullptr;
+        ok = ok && (L.xq = alloc(mmq::q8_bytes(rcap, E))) != nullptr;
+        ok = ok && (L.hq = alloc(mmq::q8_bytes(rcap, F))) != nullptr;
+        ok = ok && (L.gu = (float*) alloc((size_t) rcap * 2 * F * sizeof(float))) != nullptr;
+        ok = ok && (L.h = (float*) alloc((size_t) rcap * F * sizeof(float))) != nullptr;
+        ok = ok && (L.dn = (float*) alloc((size_t) rcap * E * sizeof(float))) != nullptr;
         {
             ok = ok && (L.x = (float*) alloc((size_t) Tmax * E * sizeof(float))) != nullptr;
             ok = ok && (L.rw = (float*) alloc((size_t) Tmax * g.n_exp_used * sizeof(float))) != nullptr;
@@ -222,6 +240,7 @@ bool GlmDsaModel::gpu_moe_alloc(int Tmax, std::string& err) {
     }
     GM_CUDA(cudaSetDevice(cur_dev_));
     st->tmax = Tmax;
+    st->rcap = (int) rcap;
     std::string names;
     for (const GmLane& L : st->lanes) names += (names.empty() ? "" : ", ") + std::to_string(L.dev);
     std::fprintf(stderr, "glm-dsa: GPU experts for long prompts on device(s) %s: groups of %d experts\n", names.c_str(),
@@ -246,6 +265,7 @@ bool GlmDsaModel::moe_gpu_batch(int il, int T, const float* XN, const float* RW,
     // the shards' mappings registered once (read-only, portable), kept: the copies read the page cache directly.
     // Whole shards, not tensors - neighbouring tensors share pages, and a page cannot be registered twice.  The pages
     // are locked as the copies first touch them; the driver refuses past ~224 GB (those shards stay pageable).
+    if (!gm_registered_ && pinned_layers_ > 0) gm_registered_ = true;   // the pinned tier holds the driver's budget
     if (!gm_registered_) {
         gm_registered_ = true;
         // a budget (STRATA_GLM_GPU_REG_GB, 80) well under what WDDM lets the GPUs map: near it, other mappings fail
@@ -290,7 +310,8 @@ bool GlmDsaModel::moe_gpu_batch(int il, int T, const float* XN, const float* RW,
         while (e < NE && bounds[(size_t) e + 1] == bounds[(size_t) e]) ++e;
         if (e >= NE) break;
         const int e0 = e;
-        e = std::min(NE, e0 + st->group);
+        const int a0 = bounds[(size_t) e0];
+        while (e < NE && e - e0 < st->group && bounds[(size_t) e + 1] - a0 <= st->rcap) ++e;
         groups.push_back({e0, e});
     }
     const size_t stride = st->stride, guh = L.gu_expert, db = L.d_expert;
@@ -312,8 +333,7 @@ bool GlmDsaModel::moe_gpu_batch(int il, int T, const float* XN, const float* RW,
         GM_CUDA(cudaMemcpyAsync(ln.bounds, bounds.data(), bounds.size() * sizeof(int), cudaMemcpyHostToDevice, s));
         GM_CUDA(cudaMemcpyAsync(ln.row_tok, row_tok.data(), row_tok.size() * sizeof(int), cudaMemcpyHostToDevice, s));
         GM_CUDA(cudaMemcpyAsync(ln.row_slot, row_slot.data(), row_slot.size() * sizeof(int), cudaMemcpyHostToDevice, s));
-        if (n_lanes > 1)   // the slots another lane multiplies stay zero in this lane's sum
-            GM_CUDA(cudaMemsetAsync(ln.dn, 0, (size_t) T * K * E * sizeof(float), s));
+        GM_CUDA(cudaMemsetAsync(out, 0, (size_t) T * E * sizeof(float), s));   // the groups add into it
         std::vector<size_t> mine;
         for (size_t gi = (size_t) li; gi < groups.size(); gi += (size_t) n_lanes) mine.push_back(gi);
         const auto issue_copy = [&](size_t k) -> bool {
@@ -370,17 +390,17 @@ bool GlmDsaModel::moe_gpu_batch(int il, int T, const float* XN, const float* RW,
             dn.n = e1 - e0;
             dn.xq = (const uint8_t*) ln.hq - (size_t) a * qblk;
             dn.bounds = ln.bounds + e0;
-            dn.ids = ln.row_slot;   // each row's result goes to its (token, slot) row
+            dn.ids = ln.iota;
             dn.total_rows = nrows;
             dn.max_rows = max_rows;
-            dn.dst = ln.dn;
+            dn.dst = ln.dn - (size_t) a * E;   // the group's rows, from 0
             dn.ld_dst = E;
             ln.ctx->run(dn, s);
             GM_CUDA(cudaEventRecord(ln.free_[b], s));
+            group_combine_kernel<<<(unsigned) (((int64_t) nrows * E + 255) / 256), 256, 0, s>>>(ln.dn, ln.row_slot + a,
+                                                                                            rw, out, nrows, K, E);
         }
         const int64_t n_out = (int64_t) T * E;
-        const unsigned n_blocks = (unsigned) ((n_out + 255) / 256);
-        moe_combine_kernel<<<n_blocks, 256, 0, s>>>(ln.dn, rw, out, T, K, E);
         GM_CUDA(cudaGetLastError());
         if (!is_main) {   // this lane's sum to the main device
             float* dst = st->lanes[(size_t) main_li].recv[(size_t) (li < main_li ? li : li - 1)];

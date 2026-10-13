@@ -162,7 +162,7 @@ private:
         float* kvg = nullptr;
         float* ikv = nullptr;
         void* cublas = nullptr;
-        float *pf = nullptr, *deq = nullptr, *att = nullptr, *pf_score = nullptr;
+        float *pf = nullptr, *pfc = nullptr, *deq = nullptr, *att = nullptr, *pf_score = nullptr;
         float *sg = nullptr, *ss = nullptr, *qc = nullptr;
         int *d_sel = nullptr, *d_cnt = nullptr;
         void* iq16 = nullptr;
@@ -191,6 +191,7 @@ private:
         const uint8_t* up = nullptr;
         const uint8_t* down = nullptr;
         size_t gu_expert = 0, d_expert = 0;   ///< bytes of one expert's slab in each tensor
+        void* pinned = nullptr;               ///< the layer's experts copied into pinned memory (the RAM tier)
         void* fmt = nullptr;                  ///< a NativeFmt, owned
     };
 
@@ -262,7 +263,9 @@ private:
     // the batched path's state (allocated by the first prefill)
     void* cublas_ = nullptr;
     int pf_chunk_ = 0, pf_sub_ = 0;
-    float* pf_ = nullptr;          ///< chunk activations
+    float* pf_ = nullptr;          ///< a sub-block's scratch (pf_rows_ rows)
+    float* pfc_ = nullptr;         ///< a chunk's rows: residual, normed, expert outputs, routes
+    int pf_rows_ = 0;
     float* deq_ = nullptr;         ///< one weight expanded to F32
     size_t deq_floats_ = 0;
     float* att_ = nullptr;         ///< attention / indexer score blocks
@@ -311,6 +314,7 @@ private:
     void* gstream_ = nullptr;
     void* gm_ = nullptr;            ///< the GPU experts' lanes (GmState, src/core/glm_dsa_gpu_moe.cu)
     bool gm_registered_ = false;
+    int pinned_layers_ = 0;
     std::vector<void*> gm_regs_;
     std::vector<void*> gA_, gB_, gS_, gC_;
     float* pin_ = nullptr;          ///< pinned: [rw 64 | ids 64 | x n_embd | moe n_embd | embd n_embd | pos 64]

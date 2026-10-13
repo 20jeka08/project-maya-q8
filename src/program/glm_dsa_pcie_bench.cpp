@@ -41,6 +41,58 @@ int main(int argc, char** argv) {
     }
     std::vector<std::unique_ptr<strata::GgufFile>> files;
     for (const auto& p : strata::gguf_split_paths(model)) files.emplace_back(new strata::GgufFile(p));
+    if (std::getenv("PIN_GB")) {   // pinned host memory in 8 GiB pieces (Maya's RAM tier): how much, how fast
+        const double want = std::atof(std::getenv("PIN_GB"));
+        int n_dev = 0;
+        cudaGetDeviceCount(&n_dev);
+        for (int d = 0; d < n_dev; ++d) cudaSetDevice(d), cudaFree(nullptr);   // both contexts first
+        cudaSetDevice(0);
+        std::vector<uint8_t*> pieces;
+        const size_t piece = (size_t) 8 << 30;
+        const double t0 = now_s();
+        while (pieces.size() * 8.0 * 1.073741824 < want) {
+            uint8_t* p = nullptr;
+            const cudaError_t e = cudaHostAlloc((void**) &p, piece, cudaHostAllocPortable);
+            if (e != cudaSuccess) {
+                std::printf("piece %zu refused: %s\n", pieces.size(), cudaGetErrorString(e));
+                cudaGetLastError();
+                break;
+            }
+            pieces.push_back(p);
+        }
+        std::printf("pinned %.0f GB in %zu pieces in %.1f s\n", pieces.size() * 8 * 1.073741824, pieces.size(),
+                    now_s() - t0);
+        // touch the pieces (as a copy from the mmap would) then DMA from them to every device at once
+        for (auto* p : pieces) std::memset(p, 1, piece);
+        std::vector<void*> d(n_dev);
+        std::vector<cudaStream_t> st(n_dev);
+        for (int k = 0; k < n_dev; ++k) {
+            cudaSetDevice(k);
+            CK(cudaMalloc(&d[k], 1u << 30));
+            CK(cudaStreamCreate(&st[k]));
+        }
+        const double t1 = now_s();
+        size_t moved = 0;
+        for (size_t i = 0; i < pieces.size(); ++i) {
+            const int k = (int) (i % n_dev);
+            cudaSetDevice(k);
+            for (size_t o = 0; o < piece; o += 1u << 30) {
+                CK(cudaMemcpyAsync(d[k], pieces[i] + o, 1u << 30, cudaMemcpyHostToDevice, st[k]));
+                moved += 1u << 30;
+            }
+        }
+        for (int k = 0; k < n_dev; ++k) cudaSetDevice(k), cudaStreamSynchronize(st[k]);
+        std::printf("DMA from pinned to all %d devices: %.1f GB/s\n", n_dev, moved / 1e9 / (now_s() - t1));
+        // what the GPU experts need besides: plain device allocations on every card
+        for (int k = 0; k < n_dev; ++k) {
+            cudaSetDevice(k);
+            void* q = nullptr;
+            const cudaError_t e = cudaMalloc(&q, (size_t) 2 << 30);
+            std::printf("device %d: 2 GB cudaMalloc beside it: %s\n", k, cudaGetErrorString(e));
+            if (q) cudaFree(q);
+        }
+        return 0;
+    }
     if (std::getenv("REG_ALL")) {   // register every shard's whole mapping; then an async copy from each
         const unsigned flags = std::atoi(std::getenv("REG_ALL"));
         cudaSetDevice(0);

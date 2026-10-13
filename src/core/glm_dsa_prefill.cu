@@ -191,20 +191,28 @@ const strata::kernels::cpu::NativeFmt& fmt_of(void* p) { return *(const strata::
 bool GlmDsaModel::pf_alloc(std::string& err) {
     if (pf_) return true;
     const GlmDsaGeometry& g = g_;
-    // chunks of 512 tokens; 2048 when the experts may run on the GPU (its weight transfer is per chunk: 3268-token
-    // prompt, RTX 5090: 1024 -> 83 s, 2048 -> 54 s)
-    int T = gpu_moe_enabled() ? 2048 : 512;
+    // chunks of 512 tokens; 8192 when the experts may run on the GPU - their weight transfer (~435 GB) is per chunk
+    // (3268-token prompt, RTX 5090: 1024 -> 83 s, 2048 -> 54 s).  A chunk keeps only its residual, its normed rows,
+    // the shared and routed expert outputs and the routes chunk-sized; attention and the dense FFNs run in sub-blocks
+    // of pf_rows_ (STRATA_GLM_SUB, 1024) rows.
+    int T = gpu_moe_enabled() ? 8192 : 512;
     if (const char* s = std::getenv("STRATA_GLM_CHUNK")) T = std::max(1, std::atoi(s));
     pf_chunk_ = T;
+    int Tb = 1024;
+    if (const char* s = std::getenv("STRATA_GLM_SUB")) Tb = std::max(1, std::atoi(s));
+    pf_rows_ = std::min(T, Tb);
     cublasHandle_t h = nullptr;
     PF_BLAS(cublasCreate(&h));
     cublas_ = h;
     PF_BLAS(cublasSetStream(h, 0));
-    const size_t per_tok = (size_t) 5 * g.n_embd + g.q_lora + g.cache_row() + (size_t) g.n_head * g.qk_head() +
+    const size_t per_row = (size_t) g.n_embd + g.q_lora + g.cache_row() + (size_t) g.n_head * g.qk_head() +
                            (size_t) g.n_head * g.kv_lora + (size_t) g.n_head * g.v_head + (size_t) 3 * g.n_ff_dense +
-                           (size_t) g.idx_heads * g.idx_key + 64 + (size_t) g.n_expert + 2 * 64;
-    PF_CUDA(cudaMalloc(&pf_, per_tok * (size_t) T * sizeof(float)));
+                           (size_t) g.idx_heads * g.idx_key + 64;
+    PF_CUDA(cudaMalloc(&pf_, per_row * (size_t) pf_rows_ * sizeof(float)));
     allocs_.push_back(pf_);
+    const size_t per_tok = (size_t) 4 * g.n_embd + (size_t) g.n_expert + 2 * 64;
+    PF_CUDA(cudaMalloc(&pfc_, per_tok * (size_t) T * sizeof(float)));
+    allocs_.push_back(pfc_);
     // the largest weight any GEMM expands
     size_t big = 0;
     for (const auto& kv : w_)
@@ -440,28 +448,29 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
             return false;
         }
 
-    // chunk activations
+    // chunk-level rows (pfc_) and sub-block scratch (pf_, pf_rows_ rows)
+    const int R = pf_rows_;
     float *X, *XN, *TMP, *MOE, *SH, *QR, *KV, *Q, *QA, *O, *GA, *UP, *HH, *IQ, *IW, *RL, *RW;
     int *IDS;
     const auto carve = [&]() {
-        X = pf_;
+        X = pfc_;
         XN = X + TE;
-        TMP = XN + TE;
-        MOE = TMP + TE;
+        MOE = XN + TE;
         SH = MOE + TE;
-        QR = SH + TE;
-        KV = QR + (size_t) T * g.q_lora;
-        Q = KV + (size_t) T * CR;
-        QA = Q + (size_t) T * H * QH;
-        O = QA + (size_t) T * H * KL;
-        GA = O + (size_t) T * H * g.v_head;
-        UP = GA + (size_t) T * g.n_ff_dense;
-        HH = UP + (size_t) T * g.n_ff_dense;
-        IQ = HH + (size_t) T * g.n_ff_dense;
-        IW = IQ + (size_t) T * g.idx_heads * g.idx_key;
-        RL = IW + (size_t) T * 64;
+        RL = SH + TE;
         RW = RL + (size_t) T * g.n_expert;
         IDS = (int*) (RW + (size_t) T * 64);
+        TMP = pf_;
+        QR = TMP + (size_t) R * E;
+        KV = QR + (size_t) R * g.q_lora;
+        Q = KV + (size_t) R * CR;
+        QA = Q + (size_t) R * H * QH;
+        O = QA + (size_t) R * H * KL;
+        GA = O + (size_t) R * H * g.v_head;
+        UP = GA + (size_t) R * g.n_ff_dense;
+        HH = UP + (size_t) R * g.n_ff_dense;
+        IQ = HH + (size_t) R * g.n_ff_dense;
+        IW = IQ + (size_t) R * g.idx_heads * g.idx_key;
     };
     carve();
 
@@ -490,9 +499,12 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
     const float theta_scale = std::pow(g.rope_base, -2.0f / (float) g.qk_rope);
     const float kq_scale = 1.0f / std::sqrt((float) QH);
     const float one = 1.0f, zero = 0.0f;
-    const int n_end = pos0 + T;               // cells visible to the chunk's last query
-    const bool any_sparse = n_end > g.idx_top_k;
-    bool sparse = false;                      // the current selection is a mask (else: every visible cell)
+    // per sub-block: whether its current selection is a list (some query sees > top_k cells) - set by the full
+    // indexer layers, read by the shared ones
+    std::vector<char> sb_sparse((size_t) (T + R - 1) / R, 0);
+    const int pos_c = pos0, T_c = T;
+    float* const X_c_unused = nullptr;
+    (void) X_c_unused;
 
     pf_mark_ = std::chrono::steady_clock::now();
     for (int il = 0; il < g.n_layers; ++il) {
@@ -505,154 +517,186 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
             carve();
             cb = (cublasHandle_t) cublas_;
             if (!hand_over(X_old, X, T, err)) return false;
-            if (sparse) {
+            if (std::find(sb_sparse.begin(), sb_sparse.end(), 1) != sb_sparse.end()) {
                 PF_CUDA(cudaMemcpy(d_sel_, sel_old, (size_t) T * g.idx_top_k * sizeof(int), cudaMemcpyDefault));
                 PF_CUDA(cudaMemcpy(d_cnt_, cnt_old, (size_t) T * sizeof(int), cudaMemcpyDefault));
             }
         }
-        // ---- attention inputs
-        rms_rows_kernel<<<T, TB>>>(X, (const float*) W(il, "attn_norm.weight").d, XN, E, E, E, g.norm_eps);
-        if (!gemm(W(il, "attn_q_a.weight"), XN, QR, T, err)) return false;
-        rms_rows_kernel<<<T, TB>>>(QR, (const float*) W(il, "attn_q_a_norm.weight").d, QR, g.q_lora, g.q_lora,
-                                   g.q_lora, g.norm_eps);
-        // kv rows [c | kpe], normed and roped, then quantized into the cache rows pos0..pos0+T-1
-        if (!gemm(W(il, "attn_kv_a_mqa.weight"), XN, KV, T, err)) return false;
-        rms_rows_kernel<<<T, TB>>>(KV, (const float*) W(il, "attn_kv_a_norm.weight").d, KV, KL, CR, CR, g.norm_eps);
-        rope_rows_kernel<<<nb((int64_t) T * g.qk_rope / 2), TB>>>(KV, T, 1, CR, CR, KL, g.qk_rope, pos0, theta_scale);
-        kv::store_q8(KV, T, CR, CR, kv_q(il), (__half*) kv_s(il), pos0, nullptr, nullptr);
+        float* const X_c = X;
+        float* const XN_c = XN;
+        int* const d_sel_c = this->d_sel_;
+        int* const d_cnt_c = this->d_cnt_;
+        const auto attn_rows = [&](int r0, int Tb) -> bool {
+            // the sub-block's rows: the attention below reads T / pos0 / X / XN / its selections as the sub-block's
+            const int T = Tb, pos0 = pos_c + r0;
+            const int64_t TE = (int64_t) T * E;
+            float* X = X_c + (size_t) r0 * E;
+            float* XN = XN_c + (size_t) r0 * E;
+            int* d_sel_ = d_sel_c + (size_t) r0 * g.idx_top_k;
+            int* d_cnt_ = d_cnt_c + r0;
+            const bool any_sparse = pos0 + T > g.idx_top_k;
+            char& sparse_c = sb_sparse[(size_t) (r0 / R)];
+            bool sparse = sparse_c != 0;
+            (void) TE;
+            // ---- attention inputs
+            rms_rows_kernel<<<T, TB>>>(X, (const float*) W(il, "attn_norm.weight").d, XN, E, E, E, g.norm_eps);
+            if (!gemm(W(il, "attn_q_a.weight"), XN, QR, T, err)) return false;
+            rms_rows_kernel<<<T, TB>>>(QR, (const float*) W(il, "attn_q_a_norm.weight").d, QR, g.q_lora, g.q_lora,
+                                       g.q_lora, g.norm_eps);
+            // kv rows [c | kpe], normed and roped, then quantized into the cache rows pos0..pos0+T-1
+            if (!gemm(W(il, "attn_kv_a_mqa.weight"), XN, KV, T, err)) return false;
+            rms_rows_kernel<<<T, TB>>>(KV, (const float*) W(il, "attn_kv_a_norm.weight").d, KV, KL, CR, CR, g.norm_eps);
+            rope_rows_kernel<<<nb((int64_t) T * g.qk_rope / 2), TB>>>(KV, T, 1, CR, CR, KL, g.qk_rope, pos0, theta_scale);
+            kv::store_q8(KV, T, CR, CR, kv_q(il), (__half*) kv_s(il), pos0, nullptr, nullptr);
 
-        // ---- the indexer (full layers): keys into their cache; the selection when a query sees > top_k cells
-        if (g.indexer_full[(size_t) il]) {
-            float* IKC = TMP;   // (free until the out-projection)
-            if (!gemm(W(il, "indexer.attn_k.weight"), XN, IKC, T, err)) return false;
-            ln_rows_kernel<<<T, 128>>>(IKC, (const float*) W(il, "indexer.k_norm.weight").d,
-                                       (const float*) W(il, "indexer.k_norm.bias").d, g.idx_key, g.idx_key,
-                                       g.idx_norm_eps);
-            rope_rows_kernel<<<nb((int64_t) T * g.qk_rope / 2), TB>>>(IKC, T, 1, g.idx_key, g.idx_key, 0, g.qk_rope,
-                                                                      pos0, theta_scale);
-            kv::store_f16(IKC, T, g.idx_key, g.idx_key, (__half*) ik_keys(il), pos0, nullptr, nullptr);
-            sparse = any_sparse;
-            if (any_sparse) {
-                const int IH = g.idx_heads, IK = g.idx_key, K = g.idx_top_k;
-                if (!gemm(W(il, "indexer.attn_q_b.weight"), QR, IQ, T, err)) return false;
-                rope_rows_kernel<<<nb((int64_t) T * IH * g.qk_rope / 2), TB>>>(IQ, T, IH, IK, (int64_t) IH * IK, 0,
-                                                                               g.qk_rope, pos0, theta_scale);
-                kv::to_f16(IQ, (__half*) iq16_, (int64_t) T * IH * IK, nullptr);
-                if (!gemm(W(il, "indexer.proj.weight"), XN, IW, T, err)) return false;
-                scale_rows_kernel<<<nb((int64_t) T * IH), TB>>>(IW, 1.0f / std::sqrt((float) (IK * IH)),
-                                                                (int64_t) T * IH);
-                // each query's selection: a query that sees <= top_k cells sees them all; else the top_k of its scores
-                // (ties to the lower cell), ascending, padded with -1 - on the device; STRATA_GLM_TOPK_HOST=1 the host
-                static const bool topk_host =
-                    std::getenv("STRATA_GLM_TOPK_HOST") && std::atoi(std::getenv("STRATA_GLM_TOPK_HOST"));
-                h_sel_.assign((size_t) T * K, -1);
-                h_cnt_.assign((size_t) T, 0);
-                hb_score_.resize((size_t) pf_sub_ * max_ctx_);
-                const void* ik16 = ik_keys(il);
-                for (int t0 = 0; t0 < T; t0 += pf_sub_) {
-                    const int ts = std::min(pf_sub_, T - t0);
-                    const int nc = pos0 + t0 + ts;
-                    PF_BLAS(cublasGemmEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, nc, ts * IH, IK, &one, ik16, CUDA_R_16F, IK,
-                                         (const __half*) iq16_ + (size_t) t0 * IH * IK, CUDA_R_16F, IK, &zero, att_,
-                                         CUDA_R_32F, nc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-                    idx_combine_kernel<<<nb((int64_t) ts * nc), TB>>>(att_, IW, pf_score_, ts, IH, nc, t0, pos0,
-                                                                      max_ctx_, t0);
-                    if (!topk_host) {   // the selection on the device (glm_dsa_kv.cuh topk_rows)
-                        kv::topk_rows(pf_score_, max_ctx_, ts, 0, pos0 + t0 + 1, K, d_sel_ + (size_t) t0 * K, K,
-                                      d_cnt_ + t0, nullptr);
-                        PF_CUDA(cudaGetLastError());
-                        continue;
-                    }
-                    PF_CUDA(cudaMemcpy2D(hb_score_.data(), (size_t) max_ctx_ * sizeof(float), pf_score_,
-                                         (size_t) max_ctx_ * sizeof(float), (size_t) nc * sizeof(float), (size_t) ts,
-                                         cudaMemcpyDeviceToHost));
-                    pool_->run(ts, [&](int tl) {
-                        const int t = t0 + tl, vis = pos0 + t + 1;
-                        int* sel = h_sel_.data() + (size_t) t * K;
-                        if (vis <= K) {
-                            for (int i = 0; i < vis; ++i) sel[i] = i;
-                            h_cnt_[(size_t) t] = vis;
-                            return;
+            // ---- the indexer (full layers): keys into their cache; the selection when a query sees > top_k cells
+            if (g.indexer_full[(size_t) il]) {
+                float* IKC = TMP;   // (free until the out-projection)
+                if (!gemm(W(il, "indexer.attn_k.weight"), XN, IKC, T, err)) return false;
+                ln_rows_kernel<<<T, 128>>>(IKC, (const float*) W(il, "indexer.k_norm.weight").d,
+                                           (const float*) W(il, "indexer.k_norm.bias").d, g.idx_key, g.idx_key,
+                                           g.idx_norm_eps);
+                rope_rows_kernel<<<nb((int64_t) T * g.qk_rope / 2), TB>>>(IKC, T, 1, g.idx_key, g.idx_key, 0, g.qk_rope,
+                                                                          pos0, theta_scale);
+                kv::store_f16(IKC, T, g.idx_key, g.idx_key, (__half*) ik_keys(il), pos0, nullptr, nullptr);
+                sparse = any_sparse;
+                if (any_sparse) {
+                    const int IH = g.idx_heads, IK = g.idx_key, K = g.idx_top_k;
+                    if (!gemm(W(il, "indexer.attn_q_b.weight"), QR, IQ, T, err)) return false;
+                    rope_rows_kernel<<<nb((int64_t) T * IH * g.qk_rope / 2), TB>>>(IQ, T, IH, IK, (int64_t) IH * IK, 0,
+                                                                                   g.qk_rope, pos0, theta_scale);
+                    kv::to_f16(IQ, (__half*) iq16_, (int64_t) T * IH * IK, nullptr);
+                    if (!gemm(W(il, "indexer.proj.weight"), XN, IW, T, err)) return false;
+                    scale_rows_kernel<<<nb((int64_t) T * IH), TB>>>(IW, 1.0f / std::sqrt((float) (IK * IH)),
+                                                                    (int64_t) T * IH);
+                    // each query's selection: a query that sees <= top_k cells sees them all; else the top_k of its scores
+                    // (ties to the lower cell), ascending, padded with -1 - on the device; STRATA_GLM_TOPK_HOST=1 the host
+                    static const bool topk_host =
+                        std::getenv("STRATA_GLM_TOPK_HOST") && std::atoi(std::getenv("STRATA_GLM_TOPK_HOST"));
+                    h_sel_.assign((size_t) T * K, -1);
+                    h_cnt_.assign((size_t) T, 0);
+                    hb_score_.resize((size_t) pf_sub_ * max_ctx_);
+                    const void* ik16 = ik_keys(il);
+                    for (int t0 = 0; t0 < T; t0 += pf_sub_) {
+                        const int ts = std::min(pf_sub_, T - t0);
+                        const int nc = pos0 + t0 + ts;
+                        PF_BLAS(cublasGemmEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, nc, ts * IH, IK, &one, ik16, CUDA_R_16F, IK,
+                                             (const __half*) iq16_ + (size_t) t0 * IH * IK, CUDA_R_16F, IK, &zero, att_,
+                                             CUDA_R_32F, nc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                        idx_combine_kernel<<<nb((int64_t) ts * nc), TB>>>(att_, IW, pf_score_, ts, IH, nc, t0, pos0,
+                                                                          max_ctx_, t0);
+                        if (!topk_host) {   // the selection on the device (glm_dsa_kv.cuh topk_rows)
+                            kv::topk_rows(pf_score_, max_ctx_, ts, 0, pos0 + t0 + 1, K, d_sel_ + (size_t) t0 * K, K,
+                                          d_cnt_ + t0, nullptr);
+                            PF_CUDA(cudaGetLastError());
+                            continue;
                         }
-                        const float* sc = hb_score_.data() + (size_t) tl * max_ctx_;
-                        std::vector<int> c((size_t) vis);
-                        std::iota(c.begin(), c.end(), 0);
-                        std::nth_element(c.begin(), c.begin() + K, c.end(), [&](int a, int b) {
-                            return sc[a] > sc[b] || (sc[a] == sc[b] && a < b);
+                        PF_CUDA(cudaMemcpy2D(hb_score_.data(), (size_t) max_ctx_ * sizeof(float), pf_score_,
+                                             (size_t) max_ctx_ * sizeof(float), (size_t) nc * sizeof(float), (size_t) ts,
+                                             cudaMemcpyDeviceToHost));
+                        pool_->run(ts, [&](int tl) {
+                            const int t = t0 + tl, vis = pos0 + t + 1;
+                            int* sel = h_sel_.data() + (size_t) t * K;
+                            if (vis <= K) {
+                                for (int i = 0; i < vis; ++i) sel[i] = i;
+                                h_cnt_[(size_t) t] = vis;
+                                return;
+                            }
+                            const float* sc = hb_score_.data() + (size_t) tl * max_ctx_;
+                            std::vector<int> c((size_t) vis);
+                            std::iota(c.begin(), c.end(), 0);
+                            std::nth_element(c.begin(), c.begin() + K, c.end(), [&](int a, int b) {
+                                return sc[a] > sc[b] || (sc[a] == sc[b] && a < b);
+                            });
+                            std::sort(c.begin(), c.begin() + K);
+                            std::copy(c.begin(), c.begin() + K, sel);
+                            h_cnt_[(size_t) t] = K;
                         });
-                        std::sort(c.begin(), c.begin() + K);
-                        std::copy(c.begin(), c.begin() + K, sel);
-                        h_cnt_[(size_t) t] = K;
-                    });
-                }
-                if (topk_host) {
-                    PF_CUDA(cudaMemcpy(d_sel_, h_sel_.data(), h_sel_.size() * sizeof(int), cudaMemcpyHostToDevice));
-                    PF_CUDA(cudaMemcpy(d_cnt_, h_cnt_.data(), h_cnt_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                    }
+                    if (topk_host) {
+                        PF_CUDA(cudaMemcpy(d_sel_, h_sel_.data(), h_sel_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                        PF_CUDA(cudaMemcpy(d_cnt_, h_cnt_.data(), h_cnt_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                    }
                 }
             }
-        }
 
-        // ---- q, absorbed
-        if (!gemm(W(il, "attn_q_b.weight"), QR, Q, T, err)) return false;
-        rope_rows_kernel<<<nb((int64_t) T * H * g.qk_rope / 2), TB>>>(Q, T, H, QH, (int64_t) H * QH, g.qk_nope,
-                                                                      g.qk_rope, pos0, theta_scale);
-        // QA[t, h, :] = kb_h^T q_nope[t, h, :]   (kb {qk_nope, kv_lora, n_head})
-        PF_BLAS(cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, KL, T, g.qk_nope, &one,
-                                          (const float*) W(il, "attn_k_b.weight").d, g.qk_nope,
-                                          (long long) g.qk_nope * KL, Q, H * QH, QH, &zero, QA, H * KL, KL, H));
+            // ---- q, absorbed
+            if (!gemm(W(il, "attn_q_b.weight"), QR, Q, T, err)) return false;
+            rope_rows_kernel<<<nb((int64_t) T * H * g.qk_rope / 2), TB>>>(Q, T, H, QH, (int64_t) H * QH, g.qk_nope,
+                                                                          g.qk_rope, pos0, theta_scale);
+            // QA[t, h, :] = kb_h^T q_nope[t, h, :]   (kb {qk_nope, kv_lora, n_head})
+            PF_BLAS(cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, KL, T, g.qk_nope, &one,
+                                              (const float*) W(il, "attn_k_b.weight").d, g.qk_nope,
+                                              (long long) g.qk_nope * KL, Q, H * QH, QH, &zero, QA, H * KL, KL, H));
 
-        // ---- attention; the context overwrites QA row by row
-        if (!sparse) {
-            // every query sees <= top_k cells: the visible rows dequantized once, then GEMMs over them
-            const int n = pos0 + T;
-            kv::gather_q8(kv_q(il), (const __half*) kv_s(il), CR, nullptr, 0, n, kvg_, nullptr);
-            for (int t0 = 0; t0 < T; t0 += pf_dsub_) {
-                const int ts = std::min(pf_dsub_, T - t0);
-                const int nc = pos0 + t0 + ts;     // the cells the block's last query sees
-                const int rows = ts * H;
-                float* QAb = QA + (size_t) t0 * H * KL;
-                PF_BLAS(cublasSgemm(cb, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, KL, &kq_scale, kvg_, CR, QAb, KL, &zero,
-                                    att_, nc));
-                PF_BLAS(cublasSgemm(cb, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, g.qk_rope, &kq_scale, kvg_ + KL, CR,
-                                    Q + (size_t) t0 * H * QH + g.qk_nope, QH, &one, att_, nc));
-                attn_softmax_kernel<<<rows, TB>>>(att_, nc, t0, pos0, H, nullptr, max_ctx_);
-                PF_BLAS(cublasSgemm(cb, CUBLAS_OP_N, CUBLAS_OP_N, KL, rows, nc, &one, kvg_, CR, att_, nc, &zero, QAb,
-                                    KL));
+            // ---- attention; the context overwrites QA row by row
+            if (!sparse) {
+                // every query sees <= top_k cells: the visible rows dequantized once, then GEMMs over them
+                const int n = pos0 + T;
+                kv::gather_q8(kv_q(il), (const __half*) kv_s(il), CR, nullptr, 0, n, kvg_, nullptr);
+                for (int t0 = 0; t0 < T; t0 += pf_dsub_) {
+                    const int ts = std::min(pf_dsub_, T - t0);
+                    const int nc = pos0 + t0 + ts;     // the cells the block's last query sees
+                    const int rows = ts * H;
+                    float* QAb = QA + (size_t) t0 * H * KL;
+                    PF_BLAS(cublasSgemm(cb, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, KL, &kq_scale, kvg_, CR, QAb, KL, &zero,
+                                        att_, nc));
+                    PF_BLAS(cublasSgemm(cb, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, g.qk_rope, &kq_scale, kvg_ + KL, CR,
+                                        Q + (size_t) t0 * H * QH + g.qk_nope, QH, &one, att_, nc));
+                    attn_softmax_kernel<<<rows, TB>>>(att_, nc, t0, pos0, H, nullptr, max_ctx_);
+                    PF_BLAS(cublasSgemm(cb, CUBLAS_OP_N, CUBLAS_OP_N, KL, rows, nc, &one, kvg_, CR, att_, nc, &zero, QAb,
+                                        KL));
+                }
+            } else {
+                // each query's own (up to) top_k cells gathered, then batched GEMMs per query: scores, softmax, context
+                const int K = g.idx_top_k;
+                for (int t0 = 0; t0 < T; t0 += pf_ssub_) {
+                    const int ts = std::min(pf_ssub_, T - t0);
+                    kv::gather_q8(kv_q(il), (const __half*) kv_s(il), CR, d_sel_ + (size_t) t0 * K, 0, ts * K, sg_,
+                                  nullptr);
+                    kv::concat_q(QA + (size_t) t0 * H * KL, Q + (size_t) t0 * H * QH, qc_, ts, H, KL, g.qk_nope,
+                                 g.qk_rope, nullptr);
+                    PF_BLAS(cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, K, H, CR, &kq_scale, sg_, CR,
+                                                      (long long) K * CR, qc_, CR, (long long) H * CR, &zero, ss_, K,
+                                                      (long long) H * K, ts));
+                    kv::softmax_counted(ss_, d_cnt_ + t0, ts, H, K, nullptr);
+                    PF_BLAS(cublasSgemmStridedBatched(cb, CUBLAS_OP_N, CUBLAS_OP_N, KL, H, K, &one, sg_, CR,
+                                                      (long long) K * CR, ss_, K, (long long) H * K, &zero,
+                                                      QA + (size_t) t0 * H * KL, KL, (long long) H * KL, ts));
+                }
             }
-        } else {
-            // each query's own (up to) top_k cells gathered, then batched GEMMs per query: scores, softmax, context
-            const int K = g.idx_top_k;
-            for (int t0 = 0; t0 < T; t0 += pf_ssub_) {
-                const int ts = std::min(pf_ssub_, T - t0);
-                kv::gather_q8(kv_q(il), (const __half*) kv_s(il), CR, d_sel_ + (size_t) t0 * K, 0, ts * K, sg_,
-                              nullptr);
-                kv::concat_q(QA + (size_t) t0 * H * KL, Q + (size_t) t0 * H * QH, qc_, ts, H, KL, g.qk_nope,
-                             g.qk_rope, nullptr);
-                PF_BLAS(cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, K, H, CR, &kq_scale, sg_, CR,
-                                                  (long long) K * CR, qc_, CR, (long long) H * CR, &zero, ss_, K,
-                                                  (long long) H * K, ts));
-                kv::softmax_counted(ss_, d_cnt_ + t0, ts, H, K, nullptr);
-                PF_BLAS(cublasSgemmStridedBatched(cb, CUBLAS_OP_N, CUBLAS_OP_N, KL, H, K, &one, sg_, CR,
-                                                  (long long) K * CR, ss_, K, (long long) H * K, &zero,
-                                                  QA + (size_t) t0 * H * KL, KL, (long long) H * KL, ts));
-            }
-        }
-        // O[t, h, :] = vb_h^T ctx[t, h, :]   (vb {kv_lora, v_head, n_head})
-        PF_BLAS(cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, g.v_head, T, KL, &one,
-                                          (const float*) W(il, "attn_v_b.weight").d, KL, (long long) KL * g.v_head, QA,
-                                          H * KL, KL, &zero, O, H * g.v_head, g.v_head, H));
-        if (!gemm(W(il, "attn_output.weight"), O, TMP, T, err)) return false;
-        add_rows_kernel<<<nb(TE), TB>>>(X, TMP, TE);
-        capture(il, 0, X + (size_t) (T - 1) * E);
+            // O[t, h, :] = vb_h^T ctx[t, h, :]   (vb {kv_lora, v_head, n_head})
+            PF_BLAS(cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, g.v_head, T, KL, &one,
+                                              (const float*) W(il, "attn_v_b.weight").d, KL, (long long) KL * g.v_head, QA,
+                                              H * KL, KL, &zero, O, H * g.v_head, g.v_head, H));
+            if (!gemm(W(il, "attn_output.weight"), O, TMP, T, err)) return false;
+            add_rows_kernel<<<nb(TE), TB>>>(X, TMP, TE);
+            capture(il, 0, X + (size_t) (T - 1) * E);
+
+            sparse_c = sparse ? 1 : 0;
+            return true;
+        };
+        for (int r0 = 0; r0 < T_c; r0 += R)
+            if (!attn_rows(r0, std::min(R, T_c - r0))) return false;
 
         // ---- the FFN
         rms_rows_kernel<<<T, TB>>>(X, (const float*) W(il, "ffn_norm.weight").d, XN, E, E, E, g.norm_eps);
-        if (il < g.dense_lead) {
-            if (!gemm(W(il, "ffn_gate.weight"), XN, GA, T, err) || !gemm(W(il, "ffn_up.weight"), XN, UP, T, err))
+        // the shared expert (or the dense FFN) of rows [r0, r0+Tb): gate/up/down in the sub-block scratch
+        const auto ffn_rows = [&](const char* gname, const char* uname, const char* dname, int n_ff, float* out,
+                                  int r0, int Tb) -> bool {
+            if (!gemm(W(il, gname), XN + (size_t) r0 * E, GA, Tb, err) ||
+                !gemm(W(il, uname), XN + (size_t) r0 * E, UP, Tb, err))
                 return false;
-            strata::kernels::glm_swiglu_clamp(GA, UP, INFINITY, (int64_t) T * g.n_ff_dense, HH, nullptr);
-            if (!gemm(W(il, "ffn_down.weight"), HH, TMP, T, err)) return false;
-            add_rows_kernel<<<nb(TE), TB>>>(X, TMP, TE);
+            strata::kernels::glm_swiglu_clamp(GA, UP, INFINITY, (int64_t) Tb * n_ff, HH, nullptr);
+            return gemm(W(il, dname), HH, out + (size_t) r0 * E, Tb, err);
+        };
+        if (il < g.dense_lead) {
+            for (int r0 = 0; r0 < T; r0 += R) {
+                const int Tb = std::min(R, T - r0);
+                if (!ffn_rows("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", g.n_ff_dense, MOE, r0, Tb))
+                    return false;
+            }
+            add_rows_kernel<<<nb(TE), TB>>>(X, MOE, TE);
         } else {
             if (!gemm(W(il, "ffn_gate_inp.weight"), XN, RL, T, err)) return false;
             strata::kernels::router_sigmoid(RL, (const float*) W(il, "exp_probs_b.bias").d, T, g.n_expert,
@@ -664,13 +708,15 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
             // a long chunk's experts on the GPU (STRATA_GLM_GPU_MOE_MIN tokens, 512: below it the CPU is as fast -
             // the GPU's cost is the weight transfer, the same for any chunk length)
             static const int gpu_min = std::getenv("STRATA_GLM_GPU_MOE_MIN") ? std::atoi(std::getenv("STRATA_GLM_GPU_MOE_MIN")) : 512;
+            const auto shexp_all = [&]() -> bool {
+                for (int r0 = 0; r0 < T; r0 += R)
+                    if (!ffn_rows("ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+                                  g.n_ff_exp * g.n_shared, SH, r0, std::min(R, T - r0)))
+                        return false;
+                return true;
+            };
             if (gpu_moe_enabled() && T >= gpu_min) {
-                const int FS = g.n_ff_exp * g.n_shared;
-                if (!gemm(W(il, "ffn_gate_shexp.weight"), XN, GA, T, err) ||
-                    !gemm(W(il, "ffn_up_shexp.weight"), XN, UP, T, err))
-                    return false;
-                strata::kernels::glm_swiglu_clamp(GA, UP, INFINITY, (int64_t) T * FS, HH, nullptr);
-                if (!gemm(W(il, "ffn_down_shexp.weight"), HH, SH, T, err)) return false;
+                if (!shexp_all()) return false;
                 static const bool ptime = std::getenv("STRATA_GLM_PF_TIME") != nullptr;
                 if (ptime) { cudaDeviceSynchronize(); pf_t_dense_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - pf_mark_).count(); pf_mark_ = std::chrono::steady_clock::now(); }
                 if (!moe_gpu_batch(il, T, XN, RW, hb_ids_.data(), MOE, err)) return false;
@@ -702,12 +748,7 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
             PF_CUDA(cudaMemcpy(hb_x_.data(), XN, (size_t) TE * sizeof(float), cudaMemcpyDeviceToHost));
             capture_ids(il, hb_ids_.data() + (size_t) (T - 1) * g.n_exp_used, hb_rw_.data() + (size_t) (T - 1) * g.n_exp_used);
             // the shared expert on the device while the CPU runs the routed ones
-            const int FS = g.n_ff_exp * g.n_shared;
-            if (!gemm(W(il, "ffn_gate_shexp.weight"), XN, GA, T, err) ||
-                !gemm(W(il, "ffn_up_shexp.weight"), XN, UP, T, err))
-                return false;
-            strata::kernels::glm_swiglu_clamp(GA, UP, INFINITY, (int64_t) T * FS, HH, nullptr);
-            if (!gemm(W(il, "ffn_down_shexp.weight"), HH, SH, T, err)) return false;
+            if (!shexp_all()) return false;
             const auto c0 = std::chrono::steady_clock::now();
             if (!moe_cpu_batch(il, T, hb_ids_.data(), hb_rw_.data(), err)) return false;
             cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
