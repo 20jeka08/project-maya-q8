@@ -447,6 +447,7 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
     for (int il = 0; il < g.n_layers; ++il) {
         if (part_of(il) != cur_) {   // the layer split: the chunk's residual to the next device, its selections too
             const float* X_old = X;
+            const int *sel_old = d_sel_, *cnt_old = d_cnt_;
             PF_CUDA(cudaDeviceSynchronize());
             bind(part_of(il));
             if (!pf_alloc(err)) return false;
@@ -454,8 +455,8 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
             cb = (cublasHandle_t) cublas_;
             if (!hand_over(X_old, X, T, err)) return false;
             if (sparse) {
-                PF_CUDA(cudaMemcpy(d_sel_, h_sel_.data(), h_sel_.size() * sizeof(int), cudaMemcpyHostToDevice));
-                PF_CUDA(cudaMemcpy(d_cnt_, h_cnt_.data(), h_cnt_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                PF_CUDA(cudaMemcpy(d_sel_, sel_old, (size_t) T * g.idx_top_k * sizeof(int), cudaMemcpyDefault));
+                PF_CUDA(cudaMemcpy(d_cnt_, cnt_old, (size_t) T * sizeof(int), cudaMemcpyDefault));
             }
         }
         // ---- attention inputs
@@ -490,7 +491,9 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
                 scale_rows_kernel<<<nb((int64_t) T * IH), TB>>>(IW, 1.0f / std::sqrt((float) (IK * IH)),
                                                                 (int64_t) T * IH);
                 // each query's selection: a query that sees <= top_k cells sees them all; else the top_k of its scores
-                // (on the host, ties to the lower cell), ascending, padded with -1
+                // (ties to the lower cell), ascending, padded with -1 - on the device; STRATA_GLM_TOPK_HOST=1 the host
+                static const bool topk_host =
+                    std::getenv("STRATA_GLM_TOPK_HOST") && std::atoi(std::getenv("STRATA_GLM_TOPK_HOST"));
                 h_sel_.assign((size_t) T * K, -1);
                 h_cnt_.assign((size_t) T, 0);
                 hb_score_.resize((size_t) pf_sub_ * max_ctx_);
@@ -503,6 +506,12 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
                                          CUDA_R_32F, nc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
                     idx_combine_kernel<<<nb((int64_t) ts * nc), TB>>>(att_, IW, pf_score_, ts, IH, nc, t0, pos0,
                                                                       max_ctx_, t0);
+                    if (!topk_host) {   // the selection on the device (glm_dsa_kv.cuh topk_rows)
+                        kv::topk_rows(pf_score_, max_ctx_, ts, 0, pos0 + t0 + 1, K, d_sel_ + (size_t) t0 * K, K,
+                                      d_cnt_ + t0, nullptr);
+                        PF_CUDA(cudaGetLastError());
+                        continue;
+                    }
                     PF_CUDA(cudaMemcpy2D(hb_score_.data(), (size_t) max_ctx_ * sizeof(float), pf_score_,
                                          (size_t) max_ctx_ * sizeof(float), (size_t) nc * sizeof(float), (size_t) ts,
                                          cudaMemcpyDeviceToHost));
@@ -525,8 +534,10 @@ bool GlmDsaModel::prefill_chunk(const int32_t* toks, int T, bool head, std::stri
                         h_cnt_[(size_t) t] = K;
                     });
                 }
-                PF_CUDA(cudaMemcpy(d_sel_, h_sel_.data(), h_sel_.size() * sizeof(int), cudaMemcpyHostToDevice));
-                PF_CUDA(cudaMemcpy(d_cnt_, h_cnt_.data(), h_cnt_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                if (topk_host) {
+                    PF_CUDA(cudaMemcpy(d_sel_, h_sel_.data(), h_sel_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                    PF_CUDA(cudaMemcpy(d_cnt_, h_cnt_.data(), h_cnt_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                }
             }
         }
 

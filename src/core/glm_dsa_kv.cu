@@ -175,7 +175,103 @@ __global__ void softmax_counted_kernel(float* S, const int* __restrict__ cnt, in
 
 int nb(int64_t n) { return (int) ((n + TB - 1) / TB); }
 
+/// float -> a key whose unsigned order is the float order
+__device__ __forceinline__ uint32_t fkey(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+/// exclusive scan of v over the block (blockDim.x <= 1024), the total to *total
+__device__ int block_scan(int v, int* sh, int* total) {
+    const int t = threadIdx.x;
+    sh[t] = v;
+    __syncthreads();
+    for (int o = 1; o < blockDim.x; o <<= 1) {
+        const int a = t >= o ? sh[t - o] : 0;
+        __syncthreads();
+        sh[t] += a;
+        __syncthreads();
+    }
+    const int incl = sh[t];
+    if (t == blockDim.x - 1) *total = incl;
+    __syncthreads();
+    return incl - v;
+}
+
+constexpr int TK = 1024;
+
+__global__ void topk_rows_kernel(const float* __restrict__ scores, int64_t ld, int n_fixed, int vis0, int K,
+                                 int* __restrict__ out, int64_t out_ld, int* __restrict__ cnt) {
+    __shared__ unsigned hist[256];
+    __shared__ int sh[TK];
+    __shared__ int s_digit, s_rem, s_total;
+    const int r = blockIdx.x, tid = threadIdx.x;
+    const int vis = n_fixed > 0 ? n_fixed : vis0 + r;
+    const float* sc = scores + (size_t) r * ld;
+    int* o = out + (size_t) r * out_ld;
+    if (vis <= K) {
+        for (int i = tid; i < K; i += blockDim.x) o[i] = i < vis ? i : -1;
+        if (cnt && tid == 0) cnt[r] = vis;
+        return;
+    }
+    // the K-th largest key: its bits fixed 8 at a time, from the top
+    uint32_t prefix = 0, mask = 0;
+    if (tid == 0) s_rem = K;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int b = tid; b < 256; b += blockDim.x) hist[b] = 0;
+        __syncthreads();
+        for (int i = tid; i < vis; i += blockDim.x) {
+            const uint32_t u = fkey(sc[i]);
+            if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            int acc = 0, rem = s_rem, d = 0;
+            for (int b = 255; b >= 0; --b) {
+                if (acc + (int) hist[b] >= rem) {
+                    d = b;
+                    rem -= acc;   // how many of the threshold's equals are still to take
+                    break;
+                }
+                acc += (int) hist[b];
+            }
+            s_digit = d;
+            s_rem = rem;
+        }
+        __syncthreads();
+        prefix |= (uint32_t) s_digit << shift;
+        mask |= 255u << shift;
+    }
+    const uint32_t thr = prefix;
+    const int take_eq = s_rem;   // equals to the threshold to include (the lowest cells first)
+    // stable compaction: each thread a contiguous range of cells
+    const int per = (vis + blockDim.x - 1) / blockDim.x;
+    const int i0 = min(vis, tid * per), i1 = min(vis, i0 + per);
+    int eq = 0;
+    for (int i = i0; i < i1; ++i) eq += fkey(sc[i]) == thr;
+    const int eq_base = block_scan(eq, sh, &s_total);
+    int inc = 0, er = eq_base;
+    for (int i = i0; i < i1; ++i) {
+        const uint32_t u = fkey(sc[i]);
+        if (u > thr) ++inc;
+        else if (u == thr) inc += (er++ < take_eq);
+    }
+    const int out_base = block_scan(inc, sh, &s_total);
+    int w = out_base;
+    er = eq_base;
+    for (int i = i0; i < i1; ++i) {
+        const uint32_t u = fkey(sc[i]);
+        if (u > thr || (u == thr && er++ < take_eq)) o[w++] = i;
+    }
+    if (cnt && tid == 0) cnt[r] = K;
+}
+
 }  // namespace
+
+void topk_rows(const float* scores, int64_t ld, int rows, int n_fixed, int vis0, int K, int* out, int64_t out_ld,
+               int* cnt, cudaStream_t st) {
+    topk_rows_kernel<<<rows, TK, 0, st>>>(scores, ld, n_fixed, vis0, K, out, out_ld, cnt);
+}
 
 void store_q8(const float* src, int T, int src_ld, int row, int8_t* q, __half* s, int pos0, const int* d_pos,
               cudaStream_t st) {

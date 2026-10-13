@@ -946,12 +946,13 @@ bool GlmDsaModel::step(int32_t token, float* logits, std::string& err, bool head
     for (int il = 0; il < g.n_layers; ++il) {
         if (part_of(il) != cur_) {   // the layer split: the residual to the next device, its selection too
             const float* x_old = x;
+            const int* cells_old = d_cells_;
             GD_CHECK(cudaDeviceSynchronize());
             bind(part_of(il));
             carve();
             if (!hand_over(x_old, x, 1, err)) return false;
             if (sparse)
-                GD_CHECK(cudaMemcpy(d_cells_, cells_.data(), cells_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                GD_CHECK(cudaMemcpy(d_cells_, cells_old, (size_t) g.idx_top_k * sizeof(int), cudaMemcpyDefault));
         }
         // ---- attention
         rms_norm_kernel<<<1, T_>>>(x, (const float*) W(il, "attn_norm.weight").d, xn, g.n_embd, g.norm_eps);
@@ -1102,6 +1103,13 @@ bool GlmDsaModel::hand_over(const float* x_from, float* x_to, int64_t rows, std:
 bool GlmDsaModel::select_cells(int il, int n_vis, const float* iq, const float* iw, float* score, std::string& err) {
     const GlmDsaGeometry& g = g_;
     if (!decode_index_scores(ik_keys(il), iq, iw, score, n_vis, err)) return false;
+    // on the device (glm_dsa_kv.cuh topk_rows); STRATA_GLM_TOPK_HOST=1: the host's nth_element, the reference
+    static const bool on_host = std::getenv("STRATA_GLM_TOPK_HOST") && std::atoi(std::getenv("STRATA_GLM_TOPK_HOST"));
+    if (!on_host) {
+        kv::topk_rows(score, 0, 1, n_vis, 0, g.idx_top_k, d_cells_, 0, nullptr, nullptr);
+        GD_CHECK(cudaGetLastError());
+        return true;
+    }
     h_score_.resize((size_t) n_vis);
     GD_CHECK(cudaMemcpy(h_score_.data(), score, (size_t) n_vis * sizeof(float), cudaMemcpyDeviceToHost));
     cells_.resize((size_t) n_vis);
@@ -1423,6 +1431,7 @@ bool GlmDsaModel::step_graph(int32_t token, float* logits, std::string& err, boo
     for (int il = 0; il < g.n_layers; ++il) {
         if (part_of(il) != cur_) {   // the layer split: the residual to the next device, its selection too
             const float* x_old = x;
+            const int* cells_old = d_cells_;
             const auto ds0 = std::chrono::steady_clock::now();
             GD_CHECK(cudaStreamSynchronize(s));
             diag_sync_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ds0).count();
@@ -1433,7 +1442,7 @@ bool GlmDsaModel::step_graph(int32_t token, float* logits, std::string& err, boo
             if (!hand_over(x_old, x, 1, err)) return false;
             diag_hand_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dh0).count();
             if (sparse)
-                GD_CHECK(cudaMemcpy(d_cells_, cells_.data(), cells_.size() * sizeof(int), cudaMemcpyHostToDevice));
+                GD_CHECK(cudaMemcpy(d_cells_, cells_old, (size_t) g.idx_top_k * sizeof(int), cudaMemcpyDefault));
         }
         GD_CHECK(cudaGraphLaunch((cudaGraphExec_t) gA_[(size_t) il], s));
         if (g.indexer_full[(size_t) il]) {

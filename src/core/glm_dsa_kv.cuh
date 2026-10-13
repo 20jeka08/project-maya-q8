@@ -44,4 +44,12 @@ void concat_q(const float* qabs, const float* q, float* qc, int T, int n_head, i
 /// softmax over the first cnt[t] entries of every row (t, h) of S [T x n_head x K]; the rest set to 0.
 void softmax_counted(float* S, const int* cnt, int T, int n_head, int K, cudaStream_t st);
 
+/// The indexer's selection on the device, one block per row r of `scores` (rows `ld` floats apart): the row sees
+/// vis = (n_fixed > 0 ? n_fixed : vis0 + r) cells; when vis <= K all of them, else the K highest scores - ties to the
+/// lower cell, as the host's nth_element did - written in ascending cell order to out + r*out_ld (padded with -1),
+/// the count to cnt[r] when cnt is non-null.  A radix select over the float keys (4 passes of 8 bits) and a stable
+/// compaction.
+void topk_rows(const float* scores, int64_t ld, int rows, int n_fixed, int vis0, int K, int* out, int64_t out_ld,
+               int* cnt, cudaStream_t st);
+
 }  // namespace strata::core::kv
