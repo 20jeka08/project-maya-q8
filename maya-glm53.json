@@ -23,6 +23,6 @@
  "lib_dirs": [
   "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\bin"
  ],
- "port": 8081,
+ "port": 8080,
  "log": "E:\\progs\\project-maya\\maya-glm53.log"
 }
