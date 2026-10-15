@@ -8,7 +8,9 @@
   "--kv",
   "int8",
   "--prefill",
-  "auto"
+  "auto",
+  "--expert-profile",
+  "E:\\progs\\Maya\\project-maya\\data\\expert-profile-glm.bin"
  ],
  "env": {
   "STRATA_GLM_RAM_GB": "320",
