@@ -22,8 +22,8 @@ What the first run does (each step is skipped when it is already done):
      on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD gfx1100/gfx1201/gfx1151 and ROCm 7 instead
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (Maya-S,
-     Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 bits, experimental and
-     NVIDIA only)
+     Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits, experimental
+     and NVIDIA only)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
   4. compiles the engine (`build/strata`, or `build-hip/strata`) for your GPU(s): 10-30 minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
@@ -82,6 +82,11 @@ HIP_ARCHS = ("gfx1100", "gfx1201", "gfx1151")        # Maya also supports Strix 
 PY_PACKAGES = list(S.PY_PACKAGES)                  # (pillow: pictures in formats other than JPEG/PNG/BMP/GIF)
 CONTEXTS = [8192, 32768, 65536, 131072]
 DEFAULT_CONTEXT = 32768
+# KV streaming, on in every config (--kv-streaming on): the attention layers' latent cache lives in RAM and 32768
+# positions of each layer in VRAM (--kv-resident N, beside it, sets another window) - from a context above that (a
+# shorter one is not streamed); 12 KB of RAM a context token, 1.6 GB at 128K.  "--kv-streaming", "off" in the config's
+# args turns it off; a setup again keeps what the config says
+KV_STREAMING = "on"
 MODEL_NAME = "glm-5.3-flash"
 SAMPLING = {"temperature": 1.0, "top_p": 0.95}     # the dashboard's and the API's defaults for requests that set none
 EFFORT = "high"                                    # thinking level for requests that name none (GLM's High)
@@ -208,7 +213,7 @@ MODELS = {
                            "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
                        "GLM-5.3-Flash-vocab.gguf":
                            "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
-    # turboderp's EXL3 (exllamav3) quant, read in place from its safetensors: the pack (tools/exl3_pack.py) puts a
+    # turboderp's EXL3 (exllamav3) quants, read in place from their safetensors: the pack (tools/exl3_pack.py) puts a
     # small GGUF of the unquantized tensors beside them.  "files": every file of the branch with its size (what is
     # downloaded, and how a download is known whole); "revision": the branch's commit the hashes belong to.
     "EXL3-3.05bpw": {
@@ -285,6 +290,95 @@ MODELS = {
             "tokenizer_config.json":
                 "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc"},
         # the pictures: the vision tower and its tokenizer are the same in every GLM-5.3-Flash quant
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "vision",
+            "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf", "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    # the same at 4.05 bits: 4-bit routed experts (3-bit at 3.05), mostly 6-bit dense weights; the indexer's kpool
+    # tensors are in its shards (3.05bpw has them in kpool_aux.safetensors)
+    "EXL3-4.05bpw": {
+        "about": "turboderp's EXL3 quant at 4.05 bits per weight (exllamav3's trellis format, which the engine reads "
+                 "in place from its safetensors), with the MTP draft block - experimental, NVIDIA GPUs only",
+        "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "4.05bpw",
+        "revision": "2a30229e67012798ba9f0cd832bb78abf4c363d5", "folder": "", "download_gb": 165.2,
+        "files": {
+            "config.json": 86509, "LICENSE": 1070, "README.md": 7238, "chat_template.jinja": 8617,
+            "generation_config.json": 194, "model-00001-of-00019.safetensors": 8587818716,
+            "model-00002-of-00019.safetensors": 8587936824, "model-00003-of-00019.safetensors": 8590375904,
+            "model-00004-of-00019.safetensors": 8590340084, "model-00005-of-00019.safetensors": 8590383216,
+            "model-00006-of-00019.safetensors": 8587986708, "model-00007-of-00019.safetensors": 8590342372,
+            "model-00008-of-00019.safetensors": 8590383800, "model-00009-of-00019.safetensors": 8587944528,
+            "model-00010-of-00019.safetensors": 8590383896, "model-00011-of-00019.safetensors": 8590342356,
+            "model-00012-of-00019.safetensors": 8590383392, "model-00013-of-00019.safetensors": 8587986540,
+            "model-00014-of-00019.safetensors": 8590342372, "model-00015-of-00019.safetensors": 8590383888,
+            "model-00016-of-00019.safetensors": 8590341500, "model-00017-of-00019.safetensors": 8587986956,
+            "model-00018-of-00019.safetensors": 8590342372, "model-00019-of-00019.safetensors": 6661824340,
+            "model.safetensors.index.json": 15963650, "mtp.safetensors": 3793519833, "processor_config.json": 909,
+            "quantization_config.json": 47905678, "tokenizer.json": 20217442, "tokenizer_config.json": 761},
+        "sha256": {
+            "config.json":
+                "df80c17a68120aeae4c1eca8a9aa67866603484f0487cd5458c08dfd3c45156d",
+            "LICENSE":
+                "30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1",
+            "README.md":
+                "4f46db37e6a7cbe3a494d6d7f616a96f4fffe6d1de68be361199a715c8d928fc",
+            "chat_template.jinja":
+                "41cff9af7b3a86c96751b107a8444f245fbda0bd5320b636a5bb1f7f4ba1a5c3",
+            "generation_config.json":
+                "230c30609ecbbb9e6583bedde8e7bdda0c6eb8fe5fad0eaeb3d1b293d751cb4f",
+            "model-00001-of-00019.safetensors":
+                "1c7a87b0fb108521d0cf3e495ca63c37732a06744131e8933ca12d2df0d8806e",
+            "model-00002-of-00019.safetensors":
+                "a67cd8e559ac013fc0d1dc58b66bd105e54bee0a31147b295089b2537646d4dc",
+            "model-00003-of-00019.safetensors":
+                "d069cea25c6082a70b2dbc601725687f8d164a5dd047894acb58476b4175c1af",
+            "model-00004-of-00019.safetensors":
+                "d222d3137bec069a165219542d49d02defef2df69763464e93463a176e2ba935",
+            "model-00005-of-00019.safetensors":
+                "6fdd4557f29e1b77248b6bbd6b35c691ef4b1dc63b7305c9f5cb0080e1c82836",
+            "model-00006-of-00019.safetensors":
+                "3e9c1f39a631dedd5cce7614947d1f3eab71c93dbb4c79bd2eec0ab413236055",
+            "model-00007-of-00019.safetensors":
+                "62eca4decce10159107948a320083d8e9dcf60f25e058877a1662b80f1412220",
+            "model-00008-of-00019.safetensors":
+                "e8f8762fa1c6a698fc74d50760b82ec72d6043fb9ef6e05dac4032999f57d7c5",
+            "model-00009-of-00019.safetensors":
+                "f9d2e2df7fc7a65c33514a584e5a228d5eb4bec72fc516d9c649c94b06e3d00e",
+            "model-00010-of-00019.safetensors":
+                "5eb19bda8461e44323898172492f9f5c948f5c8ad00816b0e004feaf8b11ccfa",
+            "model-00011-of-00019.safetensors":
+                "f2e687a3d410af6bd48f90d5770fac1054ad5c337d3cfa2bd56a5600387ba36a",
+            "model-00012-of-00019.safetensors":
+                "caee2cdd11e781195a3bbb70b53da0c08c4add3485e200a4a28119d238201523",
+            "model-00013-of-00019.safetensors":
+                "094d5b9341505d25852993e0eef6d137ba75c4179bec2204bd067af264da5dd1",
+            "model-00014-of-00019.safetensors":
+                "765f21794314da81bccdf6a1c9b3fff3f86711d34d83f7551667455a9775dc1a",
+            "model-00015-of-00019.safetensors":
+                "f08d208c8ad27b3bb9c75c42c90e33a3e8acd722ccf5f4f74df1638084d46067",
+            "model-00016-of-00019.safetensors":
+                "e4c0bbf93639fd96eddb9a38505c4de99d650f82d376c0e303a7c3fd38544c3d",
+            "model-00017-of-00019.safetensors":
+                "8e954f3e1660889a50974f46e66ad75a4e3bcadb0398a91646d58a09d9c2f54c",
+            "model-00018-of-00019.safetensors":
+                "bad6f1e51e7bd25a4da4fe55efe4f91512bf4e82085db2baa5cce1adea027c58",
+            "model-00019-of-00019.safetensors":
+                "de2031315b49f89e3d091e92bead8b239ea46e304236f34b5734a68b0b07d547",
+            "model.safetensors.index.json":
+                "ee1f2dbea800dea0b4225c38193f7ef41180ed42dd51f80a0cee58daf44cf606",
+            "mtp.safetensors":
+                "1bd09bd4eff4adc568e4ac3e92efb436c2d3aa5f0dceab4c72005d796066822d",
+            "processor_config.json":
+                "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed",
+            "quantization_config.json":
+                "d18c35bf6184a67a3b612b15c216bdfdf9e81505c0e02b646152925b13fafef3",
+            "tokenizer.json":
+                "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+            "tokenizer_config.json":
+                "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc"},
         "vision": {
             "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "vision",
             "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf", "download_gb": 1.14,
@@ -1431,6 +1525,28 @@ def sha256_ok(path: Path, want) -> bool:
     return h.hexdigest() in [w.lower() for w in ([want] if isinstance(want, str) else want)]
 
 
+VERIFIED = ".maya-verified.json"                   # in a model folder: the files whose sha256 matched, by size and time
+
+
+def sha256_checked(path: Path, want) -> bool:
+    """sha256_ok, read once: a file that matched is remembered (VERIFIED) with its size and modification time, and not
+    read again until either changes."""
+    book = read_json(path.parent / VERIFIED)
+    st = path.stat()
+    seen = book.get(path.name) or {}
+    if seen.get("size") == st.st_size and seen.get("mtime_ns") == st.st_mtime_ns:
+        return True
+    say(f"  checking {path.name}'s sha256 ...")
+    if not sha256_ok(path, want):
+        return False
+    book[path.name] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    try:
+        (path.parent / VERIFIED).write_text(json.dumps(book, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+    return True
+
+
 def offer_download(a, quant: str, d: Path, shards: list) -> bool:
     """Shows what would be downloaded - the source, the size, the exact commands - and downloads only after a yes
     (or --download-model).  False: nothing was downloaded."""
@@ -1488,10 +1604,8 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
         if why:
             fail(f"{s.name} after the download: {why}", f"delete it and run {ME} --download-model again")
         want = m["sha256"].get(hf_name(m, s))
-        if want:
-            say(f"  checking {s.name}'s sha256 ...")
-            if not sha256_ok(s, want):
-                fail(f"{s.name}: the sha256 does not match the published one", "delete it and download it again")
+        if want and not sha256_checked(s, want):
+            fail(f"{s.name}: the sha256 does not match the published one", "delete it and download it again")
         ok(f"{s.name} downloaded")
     return True
 
@@ -1562,6 +1676,39 @@ def pack_source(pack: Path):
     return m.group(1) if m else None
 
 
+PACK_SOURCES = "sources.json"                      # in a pack: its model files' sizes and times when it was built
+
+
+def pack_stale(pack: Path, shards: list):
+    """Why a pack no longer matches its model files, or None.  The pack holds where every tensor sits in them: a file
+    that changed after the pack was built leaves those places wrong (#155: a pack built while a download manager was
+    still filling files it had created at full size indexed regions with no data yet, and the engine answered garbage,
+    fast).  A pack from before the record (PACK_SOURCES): a model file written after the pack's index counts."""
+    rec = read_json(pack / PACK_SOURCES).get("files")
+    if rec:
+        old = {r.get("name"): r for r in rec}
+        for s in shards:
+            r, st = old.get(s.name) or {}, s.stat()
+            if r.get("size") != st.st_size or r.get("mtime_ns") != st.st_mtime_ns:
+                return f"{s.name} changed after the pack was built"
+        return None
+    try:
+        built = (pack / "native_experts.txt").stat().st_mtime
+    except OSError:
+        return None
+    late = [s.name for s in shards if s.stat().st_mtime > built + 60]
+    return f"{late[0]} was written after the pack was built" if late else None
+
+
+def stamp_pack(pack: Path, shards: list) -> None:
+    """The model files' sizes and times into the pack (PACK_SOURCES), for pack_stale."""
+    files = [{"name": s.name, "size": s.stat().st_size, "mtime_ns": s.stat().st_mtime_ns} for s in shards]
+    try:
+        (pack / PACK_SOURCES).write_text(json.dumps({"files": files}, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -> Path:
     step(6, "the pack (the engine's index of the model files)")
     if quant is not None and is_exl3(quant):
@@ -1572,8 +1719,21 @@ def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -
     if pack_source(pack) not in (None, shards[0].name):
         pack = d / f"pack-{quant_of(shards[0])}".lower()
     if not a.repack and pack_source(pack) == shards[0].name and all((pack / f).exists() for f in PACK_FILES):
-        ok(f"pack already built: {pack}")
-        return pack
+        why = pack_stale(pack, shards)
+        if why is None:
+            if not (pack / PACK_SOURCES).exists():
+                stamp_pack(pack, shards)
+            ok(f"pack already built: {pack}")
+            return pack
+        warn(f"the pack is built again: {why}")
+    # the files a pack is built from: a Maya download's against its published sha256 (once a file - a download is
+    # checked as it lands), so a file still being written or damaged stops here, not as garbage answers (#155)
+    m = MODELS.get(quant or "") or {}
+    for s in shards:
+        want = (m.get("sha256") or {}).get(hf_name(m, s)) if m else None
+        if want and not sha256_checked(s, want):
+            fail(f"{s.name}: the sha256 does not match the published one - still being downloaded, or damaged",
+                 f"let the download finish, or delete the file and run {ME} --download-model")
     if not os.access(d, os.W_OK):
         fail(f"{d} is not writable: the pack is written next to the GGUF files (the engine finds them at <pack>/..)",
              "link the .gguf files into a writable folder (" + ("mklink /H DIR\\<file> <file>, for each file" if WIN
@@ -1590,6 +1750,7 @@ def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -
     missing = [f for f in PACK_FILES if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
+    stamp_pack(pack, shards)
     ok(f"pack: {pack}")
     return pack
 
@@ -1744,9 +1905,12 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                  choice: tuple | None = None, dflash: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
     port = a.port or 8080
+    # --expert-cache auto: the expert pool takes the VRAM left free less the reserve (--vram-reserve-mib, 700 MiB) and
+    # is checked again once written; a number set by hand caps it at that many experts (a setup again keeps it)
     # --prefill auto (as Strata's setup writes it): the engine picks its prompt chunk - the largest its expert pool
     # can lend, up to 8192; a number (`32768`) sets the chunk itself
-    cfg = {"exe": str(EXE), "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--prefill", "auto"],
+    cfg = {"exe": str(EXE), "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--expert-cache", "auto",
+                                     "--prefill", "auto", "--kv-streaming", KV_STREAMING],
            "cwd": str(ROOT),
            "tokenizer": str(pack / "tokenizer"), "model_name": MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(SAMPLING), "reasoning_effort": EFFORT, "lib_dirs": meta.get("lib_dirs") or [],
@@ -1772,14 +1936,12 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                             "STRATA_GLM_PREFILL_MB": "6144" if total_ram >= 96 else "4096"})
         elif min(g.get("vram_gb", 0) for g in gpus) >= 20:
             hip_env.update({"STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
-        # The prompt projections' hipBLASLt solutions measured per architecture (tools/hip), one table per card's
-        # architecture (':'-separated: each card takes its own). The engine refuses a table made for another
-        # hipBLASLt version and keeps plain hipBLAS.
+        # Pass every available version per architecture: the engine's existing header guard selects the
+        # table matching each card and its installed hipBLASLt, or keeps plain hipBLAS when none matches.
         tables = []
         for arch in dict.fromkeys(g.get("arch", "") for g in gpus):
             found = sorted((ROOT / "tools" / "hip").glob(f"{arch}-glm-hipblaslt-*.txt"))
-            if found:
-                tables.append(str(found[-1]))
+            tables.extend(str(path) for path in found)
         if tables:
             hip_env["STRATA_HIPBLASLT_TUNING"] = ":".join(tables)
         env = {**hip_env, **env}
@@ -1800,12 +1962,17 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     if cfg_path.exists():
         old = read_json(cfg_path).get("args") or []
         kept = keep_args(old, cfg["args"],
-                         ("--prefill", "--parallel", "--expert-profile-save", "--expert-profile-save-every"))
+                         ("--expert-cache", "--vram-reserve-mib", "--vram-reserve-later-mib", "--prefill",
+                          "--parallel", "--expert-profile-save", "--expert-profile-save-every", "--kv-streaming",
+                          "--kv-resident"))
         kept += keep_profile(old, cfg["args"])
         if kept:
             ok("kept from the config before: " + ", ".join(kept))
     if getattr(a, "parallel", None):
         set_arg(cfg["args"], "--parallel", a.parallel)
+    if getattr(a, "vram_reserve_mib", None) is not None:   # given now: written, and a later setup keeps it
+        set_arg(cfg["args"], "--vram-reserve-mib", a.vram_reserve_mib)
+        ok(f"VRAM kept free beside the expert pool: {a.vram_reserve_mib} MiB (--vram-reserve-mib)")
     for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):
         ok(line)
     gguf_dir = local.parent if local else Path(a.gguf_dir).expanduser().resolve() if a.gguf_dir else None
@@ -2132,6 +2299,15 @@ def server_command(cfg_path: Path, a) -> tuple:
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
         if p is None or not p.exists():
             fail(f"{cfg_path.name}: {what} is missing ({p})", f"run {ME} --setup to repair it")
+    # a model file changed after its pack was built (pack_stale, #155): the pack's places in it are wrong
+    src = pack_source(pack)
+    if src is not None and src != EXL3_GGUF and all(s.exists() for s in shard_set(pack.parent / src)):
+        why = pack_stale(pack, shard_set(pack.parent / src))
+        if why is not None:
+            fail(f"{cfg_path.name}: {why}, so its index of where the tensors sit is wrong",
+                 f"run {ME} --setup --repack to build it again (a few minutes)")
+        if not (pack / PACK_SOURCES).exists():
+            stamp_pack(pack, shard_set(pack.parent / src))
     if add_profile(cfg):                               # a config written before the expert profile (an update)
         cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
         ok(f"{cfg_path.name}: starts from the shipped expert profile now (--expert-profile {PROFILE})")
@@ -2667,12 +2843,15 @@ def main() -> int:
                     help="answer up to N requests at once (1-8, default 1), kept in the config: on one GPU they are "
                          "decoded together, more tokens per second in all; each extra conversation keeps its own "
                          "context in VRAM, which the expert cache gives up")
+    ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
+                    help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
+                         "programs (default 700), kept in the config")
     ap.add_argument("--port", type=int, help="the dashboard's and the API's port (default 8080)")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this machine only (default), 0.0.0.0 = also "
                                    "other devices on your network (set --api-key too)")
     ap.add_argument("--api-key", help="require this key from API clients and the dashboard")
     ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
-                    help="an engine setting kept in the config, e.g. STRATA_GLM_RAM_HEADROOM_GB=4 (README-MAYA.md)")
+                    help="an engine setting kept in the config, e.g. STRATA_GLM_RAM_HEADROOM_GB=4 (docs/SETTINGS.md)")
     ap.add_argument("--nvcc", help="the CUDA toolkit's nvcc to build with (default: the newest that fits your GPUs)")
     ap.add_argument("--host-compiler", help="the C++ compiler nvcc uses, e.g. g++-12 (when the default g++ is newer "
                                             "than your CUDA accepts)")
@@ -2697,6 +2876,8 @@ def main() -> int:
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
                                               "for --bench or --report (default: most recently used)")
     a = ap.parse_args()
+    if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
+        ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
     if a.config is not None:
         if not a.config.is_file():
             ap.error(f"config not found: {a.config}")

@@ -1,5 +1,6 @@
-"""Maya's prompt-chunk setting in the configs it writes (Strata's --prefill engine arg: auto, kept when edited) and
-Strata's --prefill tips; no GPU, network or model downloads required.
+"""Maya's prompt-chunk setting in the configs it writes (Strata's --prefill engine arg: auto, kept when edited),
+Strata's --prefill tips, and KV streaming (--kv-streaming on in every config); no GPU, network or
+model downloads required.
 
     python -m unittest tools.test_maya_prefill
 """
@@ -109,6 +110,34 @@ class PrefillConfigTests(unittest.TestCase):
         self.assertEqual(args[args.index("--parallel") + 1], "2")
         self.assertEqual(args.count("--parallel"), 1)
 
+    def test_expert_cache_auto_and_the_vram_reserve(self):
+        # "--expert-cache", "auto" in every config; a number set by hand (and a reserve) kept by a setup again
+        for gpus in ([0], [0, 1]):
+            p, args = self.write(gpus)
+            self.assertEqual(args[args.index("--expert-cache") + 1], "auto")
+            self.assertNotIn("--vram-reserve-mib", args)      # the engine's default unless asked for
+            p.unlink()
+        p, _ = self.write([0])
+        c = json.loads(p.read_text())
+        c["args"][c["args"].index("--expert-cache") + 1] = "1200"
+        c["args"] += ["--vram-reserve-later-mib", "300"]
+        p.write_text(json.dumps(c))
+        _, again = self.write([0])
+        self.assertEqual(again[again.index("--expert-cache") + 1], "1200")
+        self.assertEqual(again[again.index("--vram-reserve-later-mib") + 1], "300")
+        self.assertEqual(again.count("--expert-cache"), 1)
+        # --vram-reserve-mib N at setup: written, kept by a later setup, a new value wins
+        self.a.vram_reserve_mib = 1500
+        _, args = self.write([0])
+        self.assertEqual(args[args.index("--vram-reserve-mib") + 1], "1500")
+        self.a.vram_reserve_mib = None
+        _, args = self.write([0])
+        self.assertEqual(args[args.index("--vram-reserve-mib") + 1], "1500")
+        self.a.vram_reserve_mib = 0
+        _, args = self.write([0])
+        self.assertEqual(args[args.index("--vram-reserve-mib") + 1], "0")
+        self.assertEqual(args.count("--vram-reserve-mib"), 1)
+
     def test_dflash2_drafter_in_the_config(self):
         # a DFlash2 setup: --dflash with the drafter's file, the answer kept for the next setup, its own tuning key
         pc = {"gpus": [{"index": i, "name": "GPU", "vram_gb": 24} for i in (0, 1)]}
@@ -136,6 +165,24 @@ class PrefillConfigTests(unittest.TestCase):
         self.assertEqual(maya.prefill_tips(["--prefill", "32768"], 177), [])
         self.assertEqual(maya.prefill_tips(["--prefill", "4096"], 32), [])
 
+    def test_kv_streaming_in_every_config(self):
+        # "--kv-streaming", "on" in every config, whatever the context or the PC
+        for ctx in (32768, 131072):
+            p, args = self.write([0], ctx)
+            self.assertEqual(args[args.index("--kv-streaming") + 1], "on")
+            self.assertEqual(args.count("--kv-streaming"), 1)
+            self.assertNotIn("--kv-resident", args)
+            p.unlink()
+        # what was set by hand (off, or a window of its own) is kept by a setup again
+        p, _ = self.write([0], 131072)
+        c = json.loads(p.read_text())
+        c["args"][c["args"].index("--kv-streaming") + 1] = "off"
+        c["args"] += ["--kv-resident", "65536"]
+        p.write_text(json.dumps(c))
+        _, again = self.write([0], 131072)
+        self.assertEqual(again[again.index("--kv-streaming") + 1], "off")
+        self.assertEqual(again[again.index("--kv-resident") + 1], "65536")
+        self.assertEqual(again.count("--kv-streaming"), 1)
 
 
 if __name__ == "__main__":

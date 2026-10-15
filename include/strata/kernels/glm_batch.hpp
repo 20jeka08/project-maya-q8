@@ -71,6 +71,9 @@ struct DsaPrepArgs {
     int q_lora = 1536;
     const float* kv_raw = nullptr; const float* kv_norm = nullptr; uint16_t* lat = nullptr; int kv_lora = 512;
     int lat_q8 = 0;   // INT8 latent records (kv_lora codes + kv_lora / 32 FP16 scales) instead of FP16 rows
+    // KV streaming (glm_kv_stream.hpp): the rows also go to the host copy, and to their block's VRAM slot when lat_table
+    // names one (lat: the identity-layout cache - the prompt path's staging copy for a streamed layer - or null)
+    uint16_t* lat_host = nullptr; uint16_t* lat_slots = nullptr; const int* lat_table = nullptr; int lat_page = 4;
     const float* ik_raw = nullptr; const float* k_norm_w = nullptr; const float* k_norm_b = nullptr;
     float* ik_cache = nullptr;
     const float* ig_raw = nullptr; float* ig_cache = nullptr;
@@ -100,7 +103,7 @@ void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, c
 /// n_head % 16 == 0, kv_lora 512. lat_q8 expands INT8 codes with one FP16 scale per 32 values as they are loaded.
 void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
                     int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8 = false);
-/// True on the current device where mla_attn_wmma2 runs (gfx11/gfx12); mla_wmma2_default() is true on gfx12 (RDNA4),
+/// True on the current device where mla_attn_wmma2 runs (gfx11/gfx12); mla_wmma2_default() is true on gfx12 (RDNA4) and gfx1151 (Strix Halo),
 /// where the prompt path prefers it over mla_attn_f16q.
 bool mla_wmma2_supported();
 bool mla_wmma2_default();

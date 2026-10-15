@@ -48,8 +48,10 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+from serve import gpu_map  # noqa: E402
 from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            effort_kwargs, effort_level, images_of, openai_to_messages)
+                            effort_kwargs, effort_level, images_of, literal_tags, mark_literals,
+                            openai_to_messages, unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.update import Updater  # noqa: E402
 
@@ -112,6 +114,7 @@ class MockEngine:
                                                                                  else script)]
         self.script, self.turns = self.scripts[0], 0
         self.last_prompt: list[int] = []
+        self.info = {"logit_bias": 1}   # it samples nothing, so every request's bias is as good as applied
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_prompt = list(ids)
@@ -229,6 +232,10 @@ class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
 
 
+# the engine's ERR when a route met a NaN or an infinity (Glm5Model::route_ok): it has dropped that conversation's state
+NONFINITE = "non-finite"
+
+
 def client_stop_strings(req: dict | None) -> list[str]:
     """A request's own stop strings: OpenAI's "stop" (a string or a list) or Anthropic's "stop_sequences" (from
     Strata #454 - they were ignored, so a client that relied on them got text past its marker)."""
@@ -238,6 +245,76 @@ def client_stop_strings(req: dict | None) -> list[str]:
     if isinstance(s, str):
         s = [s]
     return [x for x in s if isinstance(x, str) and x][:16] if isinstance(s, list) else []
+
+
+# a request's sampling fields and their JSON type (True: an integer); llama.cpp's names for two of them
+SAMPLING_TYPES = (("temperature", False), ("top_p", False), ("min_p", False), ("presence_penalty", False),
+                  ("frequency_penalty", False), ("repetition_penalty", False), ("top_k", True),
+                  ("penalty_last_n", True), ("seed", True))
+
+
+def check_request_sampling(req: dict) -> None:
+    """A request's sampling fields, read the way the run config's are, or a 400 (ValueError) that names the field.
+    Some clients send numbers as strings ("temperature": "0.7"): read and used.  A value that cannot be read as its
+    type ("temperature": "warm", "top_k": 40.5, "seed": true) is refused - before, it replaced the configured default
+    and the engine line left it out, so the answer was silently greedy.  Ranges behave as before (a temperature <= 0 is
+    greedy, top_k 0 or above 64 the widest list, a seed <= 0 none) and an absent or null field is not checked.
+    llama.cpp's repeat_penalty / repeat_last_n are taken as repetition_penalty / penalty_last_n (those win)."""
+    if not isinstance(req, dict):
+        return
+    if req.get("repeat_penalty") is not None and req.get("repetition_penalty") is None:
+        req["repetition_penalty"] = req["repeat_penalty"]
+    rl = req.get("repeat_last_n")
+    if req.get("penalty_last_n") is None and isinstance(rl, int) and not isinstance(rl, bool) and rl > 0:
+        req["penalty_last_n"] = rl      # 0 and -1 (off / the whole context) keep the engine's default window
+    for key, integer in SAMPLING_TYPES:
+        value = req.get(key)
+        if value is None:
+            continue
+        what = f"{key}: {'an integer' if integer else 'a number'}"
+        if isinstance(value, str) and value.strip():
+            try:
+                num = float(value)
+            except ValueError:
+                raise ValueError(what) from None
+            if num != num or num in (float("inf"), float("-inf")):
+                raise ValueError(what)
+            if integer:
+                if num != int(num):
+                    raise ValueError(what)
+                num = int(num)
+            elif re.fullmatch(r"\s*[+-]?\d+\s*", value):
+                num = int(value)
+            req[key] = value = num
+        if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
+            raise ValueError(what)
+
+
+def logit_bias_of(value, vocab_size: int | None = None) -> dict[int, float]:
+    """OpenAI's logit_bias - {"<token id>": bias, ...}, bias -100..100 - as {id: bias}; {} for none.  A bias of -100
+    bans the token.  Anything else is a 400 (ValueError) naming the field, before anything is sent."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError('logit_bias: an object of {"<token id>": bias}')
+    out = {}
+    for token, bias in value.items():
+        if isinstance(token, bool) or not re.fullmatch(r"[0-9]+", str(token)):
+            raise ValueError("logit_bias: token ids are non-negative integers")
+        tid = int(token)
+        if tid > 2 ** 31 - 1 or (vocab_size and tid >= vocab_size):
+            raise ValueError(f"logit_bias: token {tid} is outside the model's vocabulary")
+        if isinstance(bias, str):
+            try:
+                bias = float(bias)
+            except ValueError:
+                raise ValueError("logit_bias: biases are numbers from -100 to 100") from None
+        if isinstance(bias, bool) or not isinstance(bias, (int, float)) or not -100 <= bias <= 100:
+            raise ValueError("logit_bias: biases are numbers from -100 to 100")
+        out[tid] = float(bias)
+    if vocab_size and sum(b <= -100 for b in out.values()) >= vocab_size:
+        raise ValueError("logit_bias: it cannot ban the whole vocabulary")
+    return out
 
 
 # A FROZEN engine (Strata #1317).  Silence alone proves nothing: on a slow PC the engine reads a long prompt chunk for
@@ -353,8 +430,9 @@ class StrataEngine:
         self._tls = threading.local()                   # the request this thread is generating (pause())
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
+        self.vram = []                   # VRAM lines: what each part holds on its GPU (the Monitor's GPU map)
         self.prefill_tok_s_mean = None
-        self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
+        self.progress = None             # (read, total, reuse, ms) prompt progress while a prompt is read, from PP lines
         try:                             # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
@@ -366,6 +444,10 @@ class StrataEngine:
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
                     self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+            if line.startswith("VRAM "):
+                part = gpu_map.parse(line)
+                if part:
+                    self.vram.append(part)
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -598,10 +680,13 @@ class StrataEngine:
             sn = tune.get("spec_n_min")   # ... drafts it keeps whatever their confidence
             if isinstance(sn, int) and not isinstance(sn, bool) and 0 <= sn <= 15:
                 tune_keys += f" spec_n_min={sn}"
+        bias = sampling.get("logit_bias")      # {id: bias}, checked by the handler (logit_bias_of)
+        bias_key = (" logit_bias=" + ",".join(f"{int(i)}:{float(b):g}" for i, b in sorted(bias.items()))
+                    if isinstance(bias, dict) and bias else "")
         if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic)
-            return " temperature=0" + think + tune_keys + StrataEngine.projection_key(sampling)
+            return " temperature=0" + think + tune_keys + StrataEngine.projection_key(sampling) + bias_key
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
@@ -637,7 +722,7 @@ class StrataEngine:
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
         keys += think + tune_keys
-        return keys + StrataEngine.projection_key(sampling)
+        return keys + StrataEngine.projection_key(sampling) + bias_key
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -692,7 +777,13 @@ class StrataEngine:
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                        self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
+                        # (read, total, reuse, ms): prompt progress, one per chunk: also a heartbeat (the
+                        # lines reset the 10 s wait, so without this a long prompt would send no keep-alives at all).
+                        # `reuse` (engines that print the field): what the conversation cache already held,
+                        # `ms` the prompt read's own clock - both go to the stream's prompt_progress
+                        self.progress = (int(f[1]), int(f[2]),
+                                         int(f[5]) if len(f) >= 6 and f[5].isdigit() else 0,
+                                         float(f[3]) if len(f) >= 4 else 0.0)
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
@@ -799,7 +890,9 @@ class StrataEngine:
                     yield int(f[2])
                 elif line.startswith("PP "):
                     if len(f) >= 4 and f[2].isdigit() and f[3].isdigit():
-                        self.progress = (int(f[2]), int(f[3]))
+                        self.progress = (int(f[2]), int(f[3]),
+                                         int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
+                                         float(f[4]) if len(f) >= 5 else 0.0)
                         self.prefill_tok_s_mean = float(f[5]) if len(f) >= 6 else None
                     if cancel.is_set():
                         return
@@ -1147,12 +1240,13 @@ def child_env(cfg: dict) -> dict:
 class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
+    special_tokens = {s: 256 + k for k, s in enumerate(SPECIALS)}
 
-    def encode(self, text, parse_special=False):
+    def encode(self, text, parse_special=False, plain=()):
         out, i = [], 0
         while i < len(text):
             for k, s in enumerate(self.SPECIALS):
-                if parse_special and text.startswith(s, i):
+                if parse_special and text.startswith(s, i) and not any(a <= i < b for a, b in plain):
                     out.append(256 + k)
                     i += len(s)
                     break
@@ -1243,6 +1337,35 @@ class Service:
         self.think_budget = 0
         end = _special_ids("</think>")
         self.think_end_id = end[0] if end else None
+        # the special literals that stay text inside a message (frontend.mark_literals): every one the vocabulary has
+        self.literals = literal_tags(getattr(tokenizer, "special_tokens", None))
+
+    def check_request(self, req: dict) -> None:
+        """A request's sampling fields and logit_bias, checked (a ValueError is the 400) and kept in the form the engine
+        line takes, before anything is sent.  A logit_bias needs an engine that applies it (INFO logit_bias=1): an
+        older one would answer as if it had none."""
+        check_request_sampling(req)
+        bias = logit_bias_of(req.get("logit_bias"), len(getattr(self.tok, "tokens", None) or ()) or None)
+        if bias and (getattr(self.engine, "info", None) or {}).get("logit_bias") != 1:
+            raise ValueError("logit_bias: this engine does not apply token biases - update Maya (./maya.sh --setup)")
+        if "logit_bias" in req:
+            req["logit_bias"] = bias
+
+    def render_ids(self, messages, tools, kwargs, suffix="") -> list[int]:
+        """The template rendered for `messages` and `tools` (+ `suffix`, text the server appends to the prompt) and
+        tokenized.  A special token's text inside a message or a tool is encoded as that text; only the literals the
+        template (or the suffix) writes are special tokens."""
+        marked, marked_tools, changed = mark_literals(messages, tools, self.literals)
+        prompt = self.template.render(marked, tools=marked_tools, **kwargs)
+        if kwargs.get("enable_thinking") is False and prompt.endswith("<think>"):
+            # GLM-5.3's template opens the thinking block whatever it is told (no enable_thinking, and an effort it
+            # does not know means 'max'): with thinking off the answer was written inside an open <think>.  Close
+            # it empty, the form the same template writes for a past turn that did not think.
+            prompt += "</think>"
+        if not changed:
+            return self.tok.encode(prompt + suffix, parse_special=True)
+        prompt, plain = unmark_literals(prompt, self.literals)
+        return self.tok.encode(prompt + suffix, parse_special=True, plain=plain)
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -1300,6 +1423,7 @@ class Service:
             reload = dict(self.reload) if self.reload else None
         return {"context": self.engine.max_context, "min": CONTEXT_MIN, "max": max(top, self.engine.max_context),
                 "trained": self.trained_context, "kv_gb": info.get("kv_gb"), "kv_ctx": info.get("kv_ctx"),
+                "kv_resident": info.get("kv_resident") or 0,
                 "vram_gb": info.get("vram_gb"), "vram_slots": info.get("vram_slots"), "reload": reload}
 
     def set_context(self, n: int) -> dict:
@@ -1488,7 +1612,7 @@ class Service:
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
-            live["prompt_read"], live["prompt_total"] = progress
+            live["prompt_read"], live["prompt_total"] = progress[0], progress[1]
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
                   "trained_context": self.trained_context}
@@ -1502,10 +1626,66 @@ class Service:
             sh = list(getattr(self.engine, "stat_history", []) or [])
             tiers = {"now": stat, "history": {k: [s.get(k) for s in sh] for k in
                                               ("tok_s", "ms_tok", "vram_hit", "ram_fetch", "disk", "promo")}}
-        return {"engine": engine, "live": live, "tiers": tiers, "requests": hist[::-1][:None if all_requests else 12],
-                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+        hw = dict(tel["now"])
+        cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
+        return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": self._gpu_map(cards),
+                "requests": hist[::-1][:None if all_requests else 12],
+                "requests_kept": len(hist), "totals": totals, "hardware": hw,
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": self.storage()}
+
+    def _gpu_map(self, cards):
+        """What fills each GPU (serve/gpu_map.py): the engine's VRAM lines and NVML's cards, with the engine's and the
+        vision encoder's processes told apart from other programs; None for an engine without VRAM lines."""
+        report = getattr(self.engine, "vram", None)
+        if not report:
+            return None
+        proc = getattr(self.engine, "proc", None)
+        v = self.vision
+        vproc = getattr(v, "proc", None) if v is not None else None
+        lent = v is not None and getattr(v, "lend", None) is not None and (vproc is not None or getattr(v, "owed", False))
+        return gpu_map.view(report, cards, proc.pid if proc is not None else None,
+                            vproc.pid if vproc is not None else None, lent)
+
+    # the GLM engine's live STAT values (StrataEngine._parse_stat) exported as gauges: key -> help
+    PROM_STAT = {"tok_s": "Decode rate over the running request, tokens/s",
+                 "vram_hit": "Share of the routed experts found in VRAM (0..1)",
+                 "ram_fetch": "Experts a token read from the RAM tier",
+                 "disk": "Experts a token read from the SSD",
+                 "promo": "Experts a token promoted into VRAM",
+                 "vram_used": "Expert slots in use in VRAM", "vram_slots": "Expert slots in VRAM",
+                 "ram_used": "Expert slots in use in RAM", "ram_slots": "Expert slots in RAM"}
+
+    def prometheus(self) -> str:
+        """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
+        metric names (llamacpp:*) so its dashboards work unchanged; the requests and the engine's expert tiers as
+        maya:*."""
+        with self.status_lock:
+            s, t, active = dict(self.status), dict(self.totals), self.active
+        stat = dict(getattr(self.engine, "stat", None) or {})
+        prompt_n = t["prompt_tokens"] - t["reused"]               # what was read, as llama.cpp counts it
+        prompt_s, decode_s = t["prompt_ms"] / 1000, t["decode_ms"] / 1000
+        rows = [
+            ("llamacpp:prompt_tokens_total", "counter", "Prompt tokens read", prompt_n),
+            ("llamacpp:prompt_tokens_cached_total", "counter", "Prompt tokens the kept conversation already held",
+             t["reused"]),
+            ("llamacpp:prompt_seconds_total", "counter", "Prompt read time", prompt_s),
+            ("llamacpp:tokens_predicted_total", "counter", "Tokens generated", t["output_tokens"]),
+            ("llamacpp:tokens_predicted_seconds_total", "counter", "Generation time", decode_s),
+            ("llamacpp:prompt_tokens_seconds", "gauge", "Average prompt read throughput in tokens/s",
+             prompt_n / prompt_s if prompt_s else 0),
+            ("llamacpp:predicted_tokens_seconds", "gauge", "Average generation throughput in tokens/s",
+             t["output_tokens"] / decode_s if decode_s else 0),
+            ("llamacpp:requests_processing", "gauge", "Requests running", max(active, int(bool(s.get("busy"))))),
+            ("llamacpp:requests_deferred", "gauge", "Requests waiting their turn", s.get("queued") or 0),
+            ("maya:requests_total", "counter", "Requests finished", t["requests"]),
+            ("maya:engine_alive", "gauge", "1 while the engine process runs",
+             int(self.engine.alive()) if hasattr(self.engine, "alive") else 1),
+        ]
+        rows += [(f"maya:engine_{k}", "gauge", h, stat[k]) for k, h in self.PROM_STAT.items()
+                 if isinstance(stat.get(k), (int, float)) and not isinstance(stat.get(k), bool)]
+        return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
+                       for name, kind, help_, value in rows)
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
@@ -1555,20 +1735,13 @@ class Service:
             kwargs["enable_thinking"] = False
         if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
             kwargs = {**kwargs, **effort_kwargs(self.default_effort)}   # the run config's thinking level
-        prompt = self.template.render(messages, tools=tools, **kwargs)
-        if kwargs.get("enable_thinking") is False and prompt.endswith("<think>"):
-            # GLM-5.3's template opens the thinking block whatever it is told (no enable_thinking, and an effort it
-            # does not know means 'max'): with thinking off the answer was written inside an open <think>.  Close
-            # it empty, the form the same template writes for a past turn that did not think.
-            prompt += "</think>"
         prefill = ""
         if force is not None and tools:
             # GLM's form opens with the tool's name, Qwen's with <function=NAME>
             glm_calls = "<arg_key>" in self.template.source
             prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
-            prompt += prefill
         given["_prefill"] = prefill
-        ids = self.tok.encode(prompt, parse_special=True)
+        ids = self.render_ids(messages, tools, kwargs, prefill)
         self.embeddings.path = None
         images = images_of(messages)
         if images:
@@ -1632,9 +1805,8 @@ class Service:
             tools = (tools or []) + self.mcp.template_tools(exclude=own) or None
         if self.default_effort and "reasoning_effort" not in kw and "enable_thinking" not in kw:
             kw = {**kw, **effort_kwargs(self.default_effort)}
-        prompt = self.template.render(messages, tools=tools, **kw)
         images = len(images_of(messages))
-        return {"tokens": len(self.tok.encode(prompt, parse_special=True)), "images": images,
+        return {"tokens": len(self.render_ids(messages, tools, kw)), "images": images,
                 "approximate": images > 0, "max_context": self.engine.max_context}
 
     def _note(self, n, evs):
@@ -1841,14 +2013,35 @@ class Service:
                     think_budget = max(1, min(think_budget, int(max_new) - reserve))
                 if in_think:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
-                gen = self._sliced(ids, max_new, sampling, cancel, emb, hold)
+
+                def attempts():
+                    """The engine's tokens.  When its numbers went non-finite (a NaN or an infinity in a route: the
+                    engine's ERR says "non-finite") before the first token, the engine has dropped that conversation's
+                    state and the request runs once more, its prompt read from token 0."""
+                    for again in (False, True):
+                        sliced, got = self._sliced(ids, max_new, sampling, cancel, emb, hold), 0
+                        try:
+                            for t in sliced:
+                                got += t is not None
+                                yield t
+                            return
+                        except ValueError as e:
+                            if again or got or NONFINITE not in str(e):
+                                raise
+                            print(f"[maya] the engine's numbers went non-finite before the answer started ({e}): "
+                                  "running the request again from token 0", flush=True)
+                        finally:
+                            sliced.close()
+                gen = attempts()
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
                 try:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
                             last_print = self._progress(last_print)
-                            yield "ping", None
+                            pr = getattr(self.engine, "progress", None)   # (read, total, reuse, ms), the PP parse
+                            yield "ping", ({"total": pr[1], "cache": pr[2], "processed": pr[0],
+                                            "time_ms": round(pr[3])} if pr and len(pr) >= 4 else None)
                             continue
                         n += 1
                         if my_first is None:
@@ -1898,9 +2091,20 @@ class Service:
                           flush=True)
                     raise
                 except ValueError as e:                 # the engine's ERR line (it may have ended after it)
-                    finish = "error"
-                    print(f"[maya] the engine reported an error: {e}", flush=True)
-                    raise
+                    if NONFINITE in str(e) and n > 0:
+                        # an answer already under way: it ends here (what was sent stands), and the engine has
+                        # dropped the conversation's state, so the next turn reads it from token 0
+                        finish = "length"
+                        print(f"[maya] the engine's numbers went non-finite after {n} tokens ({e}): the answer ends "
+                              "there", flush=True)
+                        if held:
+                            for ev in parser.feed(held):
+                                yield "event", ev
+                            held = ""
+                    else:
+                        finish = "error"
+                        print(f"[maya] the engine reported an error: {e}", flush=True)
+                        raise
                 finally:
                     gen.close()                         # STOP+drain to THIS request's DONE while still holding the
                     #                                     fifo, so a stop-token break can't leave the shared engine
@@ -2131,8 +2335,15 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     json_mode = isinstance(rf, dict) and rf.get("type") in ("json_object", "json_schema")
     held = []
     for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
+        # ^ kind "ping": x carries the prompt's progress (total, cache, processed, time_ms) while the engine reads,
+        #   or None while this request just waits (queued again, an MCP round's engine work)
         if kind == "ping":
-            yield None
+            if req.get("return_progress") and req.get("stream") and isinstance(x, dict):
+                c = chunk({})
+                c["prompt_progress"] = x          # llama.cpp's field: the prompt read's progress, for a client's bar
+                yield c
+            else:
+                yield None
         elif kind == "mcp":
             c = chunk({})
             c["strata_mcp"] = x
@@ -2265,7 +2476,7 @@ def jobs_put(job: StreamJob) -> None:
 def openai_collect(chunks) -> dict:
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
     for c in chunks:
-        if c is None:                              # a heartbeat
+        if c is None or c.get("prompt_progress"):  # a heartbeat, a prompt-progress chunk: not answer content
             continue
         if c.get("strata_mcp"):
             mcp.append(c["strata_mcp"])
@@ -2581,6 +2792,15 @@ def make_handler(svc: Service):
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
                     self._json(200, svc.metrics(all_requests="requests=all" in self.path))
                 return
+            if path == "/metrics/prometheus":
+                if self._authorized():
+                    body = svc.prometheus().encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                return
             if path == "/settings":
                 if self._authorized():
                     self._json(200, {"shared": bool(svc.shared), "defaults": svc.shared})
@@ -2810,6 +3030,7 @@ def make_handler(svc: Service):
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             req["_api"] = "web" if req.get("strata_resume") is True else "openai"   # the Monitor's request table
+            svc.check_request(req)                             # a bad sampling field or logit_bias: a 400, now
             messages, tools, kw = openai_to_messages(req)
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
@@ -2909,6 +3130,7 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
             req["_api"] = "anthropic"
+            svc.check_request(req)                             # a bad sampling field: a 400, now
             messages, tools, kw = anthropic_to_messages(req)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)

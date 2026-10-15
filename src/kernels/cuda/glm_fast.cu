@@ -2440,11 +2440,19 @@ __device__ __forceinline__ void lat8_store_warp(float y, uint8_t* rec, int kv_lo
     ((int8_t*) rec)[c] = (int8_t) q;
     if (lane == 0) ((__half*) (rec + kv_lora))[c >> 5] = d16;
 }
+// value c of a latent row y into row `row` of a cache (FP16 rows, or INT8 records written by whole warps)
+__device__ __forceinline__ void lat_put(uint16_t* lat, int64_t row, float y, bool q8, int kv_lora, int c) {
+    if (q8)
+        lat8_store_warp(y, (uint8_t*) lat + (size_t) lat8_rec_bytes(kv_lora) * row, kv_lora, c, c & 31);
+    else
+        lat[(size_t) kv_lora * row + c] = lat_h(y);
+}
 // ---------------------------------------------------------------- DSA
 __global__ void __launch_bounds__(512) dsa_prep_kernel(const __grid_constant__ DsaPrepArgs a) {
     __shared__ float sred[32];
     const int tid = threadIdx.x, lane = tid & 31;
     if (blockIdx.x == 0) {
+        if (a.qr_raw == nullptr) return;   // the caches only (the one-GPU MTP decode's NextN cache fill)
         // q_a norm -> qr (f32) and qr_q (q8_1); q_lora <= 2048 (stride 512 keeps warps on 32-runs)
         float vals[4];
         float ss = 0.0f;
@@ -2469,10 +2477,12 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const __grid_constant__ D
         const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
         if (tid < a.kv_lora) {   // (kv_lora % 32 == 0: whole warps)
             const float y = v * inv * a.kv_norm[tid];
-            if (a.lat_q8)
-                lat8_store_warp(y, (uint8_t*) a.lat + (size_t) lat8_rec_bytes(a.kv_lora) * a.p, a.kv_lora, tid, tid & 31);
-            else
-                a.lat[(size_t) a.kv_lora * a.p + tid] = lat_h(y);
+            if (a.lat != nullptr) lat_put(a.lat, a.p, y, a.lat_q8, a.kv_lora, tid);
+            if (a.lat_host != nullptr) {   // KV streaming: the host copy, and the block's VRAM slot when it is resident
+                lat_put(a.lat_host, a.p, y, a.lat_q8, a.kv_lora, tid);
+                const int sl = a.lat_table[a.p / a.lat_page];
+                if (sl >= 0) lat_put(a.lat_slots, (int64_t) sl * a.lat_page + a.p % a.lat_page, y, a.lat_q8, a.kv_lora, tid);
+            }
         }
         return;
     }
@@ -3323,7 +3333,7 @@ constexpr int GU_WARPS = 16;  // ... 2 gate + 2 up rows per warp (8 per warp mea
 // into sh_out while the routed experts' blocks run - in moe_down it was a serial tail (~25 us of 72)
 #if defined(STRATA_USE_HIP)
 template<int TG, int NW = GU_WARPS, bool LUT = false, bool GLOBAL = false, bool SPLIT = false,
-         bool DIRECT = false, bool WIDE = false, int MINWAVES = 0>
+         bool DIRECT = false, bool WIDE = false, int MINWAVES = 0, bool MULTI = false>
 __attribute__((amdgpu_waves_per_eu(MINWAVES > 0 ? MINWAVES : 1)))
 __global__ void __launch_bounds__(NW * 32)
 #else
@@ -3339,14 +3349,29 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     if (d.skip != nullptr && *d.skip) return;
 #if !defined(STRATA_USE_HIP)
     constexpr int NW = GU_WARPS;
+    const int ei = blockIdx.y, chunk = blockIdx.x, n_chunks = (int) gridDim.x;
+#else
+    int ei = blockIdx.y, chunk = blockIdx.x, n_chunks = (int) gridDim.x;
+    if constexpr (MULTI) {
+        // moe_experts_multi: x = (expert, token) with the token fastest, y = the chunk - every token's blocks for a chunk
+        // run together; token t's plan, input, h and shared expert at d's mt_ strides
+        const int t = (int) blockIdx.x % d.mt_T;
+        ei = (int) blockIdx.x / d.mt_T;
+        chunk = blockIdx.y;
+        n_chunks = (int) gridDim.y;
+        d.plan_ptr += 8 * t;
+        xq += (size_t) t * d.mt_xq_s;
+        hq += (size_t) t * d.mt_hq_s;
+        if (sh_hq != nullptr) sh_hq += (size_t) t * d.mt_sh_hq_s;
+        if (sh_out != nullptr) sh_out += (size_t) t * d.mt_out_s;
+    }
 #endif
-    const int ei = blockIdx.y, chunk = blockIdx.x;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 #if defined(STRATA_USE_HIP)
     if constexpr (!SPLIT)
 #endif
     if (ei == k) {
-        const int per = (n_embd + (int) gridDim.x - 1) / (int) gridDim.x;
+        const int per = (n_embd + n_chunks - 1) / n_chunks;
         const int r1 = min(n_embd, (chunk + 1) * per);
         for (int r = chunk * per + warp; r < r1; r += NW) {
             const float v = any_row_dot(sh_type, sh_down, r, sh_hq, nullptr, n_ff_sh, lane);
@@ -3404,7 +3429,8 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
 constexpr int DOWN_ROWS = 4;
 
 #if defined(STRATA_USE_HIP)
-template<int TD, int NR = DOWN_ROWS, bool LUT = false, bool GLOBAL = false, bool DIRECT = false, bool WIDE = false>
+template<int TD, int NR = DOWN_ROWS, bool LUT = false, bool GLOBAL = false, bool DIRECT = false, bool WIDE = false,
+         bool MULTI = false>
 #else
 template<int TD>
 #endif
@@ -3414,6 +3440,22 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     if (d.skip != nullptr && *d.skip) return;
 #if !defined(STRATA_USE_HIP)
     constexpr int NR = DOWN_ROWS;
+    const int rb0 = blockIdx.x;
+#else
+    int rb0 = blockIdx.x;
+    if constexpr (MULTI) {
+        // moe_experts_multi: x = (row block, token) with the token fastest; token t's plan, h, shared expert output,
+        // output and CPU part at d's mt_ strides
+        const int t = (int) blockIdx.x % d.mt_T;
+        rb0 = (int) blockIdx.x / d.mt_T;
+        d.plan_ptr += 8 * t;
+        d.plan_w += 8 * t;
+        hq += (size_t) t * d.mt_hq_s;
+        if (sh_out != nullptr) sh_out += (size_t) t * d.mt_out_s;
+        out += (size_t) t * d.mt_out_s;
+        d.cpu_flag += t;
+        d.cpu_part += (size_t) t * d.mt_cpu_s;
+    }
 #endif
     // NR output rows per block; warp w computes those rows for expert w (one activation load per call
     // for all of them), the combine runs in plan order like the reference's axpy chain
@@ -3433,7 +3475,7 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int r0 = blockIdx.x * NR;
+    const int r0 = rb0 * NR;
     const size_t drb = rbytes<TD>(n_ff);
     {
         float s[NR];
@@ -3774,6 +3816,34 @@ __global__ void rows_q8_kernel(const float* __restrict__ x, int ld, int rows, in
 }
 
 // ---------------------------------------------------------------- the NextN block's glue
+// A chained draft's embedding row: row *tok of token_embd kept on the device, the token the previous draft step's argmax
+// left there.  Dequantized as ggml's to_float does it, so the floats are the host's bit for bit: Q6_K d * scale * q (the
+// two products in that order, dequantize_row_q6_K), Q8_0 q * d.  One thread a value.
+__global__ void embed_tok_kernel(const void* __restrict__ table, int type, int n_rows, const int* __restrict__ tok,
+                                 int n_embd, float* __restrict__ out) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_embd) return;
+    const int t = *tok;
+    if (t < 0 || t >= n_rows) {   // (never: a draft is a row of the head)
+        out[e] = 0.0f;
+        return;
+    }
+    if (type == 8) {
+        const block_q8_0* b = (const block_q8_0*) table + (size_t) t * (n_embd / QK8_0) + e / QK8_0;
+        out[e] = (float) b->qs[e % QK8_0] * __half2float(b->d);
+        return;
+    }
+    // Q6_K: 256 values a block in two halves of 128, each four runs of 32 (ggml-quants.c's loop order)
+    const block_q6_K* b = (const block_q6_K*) table + (size_t) t * (n_embd / QK_K) + e / QK_K;
+    const int j = e % QK_K, h = j / 128, r = j % 128, quarter = r / 32, l = r % 32, is = l / 16;
+    const uint8_t* ql = b->ql + 64 * h;
+    const uint8_t* qh = b->qh + 32 * h;
+    const int8_t* sc = b->scales + 8 * h;
+    const int lo = quarter & 1 ? ql[l + 32] : ql[l];
+    const int q = (quarter < 2 ? (lo & 0xF) : (lo >> 4)) | (((qh[l] >> (2 * quarter)) & 3) << 4);
+    out[e] = __half2float(b->d) * (float) sc[is + 2 * quarter] * (float) (int8_t) (q - 32);
+}
+
 // cat = [rms(emb) * enorm, rms(h) * hnorm] as q8_1 (eh_proj's input); n_embd <= 4096, one block of 1024
 __global__ void __launch_bounds__(1024) mtp_in_kernel(const float* __restrict__ emb, const float* __restrict__ h,
                                                       const float* __restrict__ enorm, const float* __restrict__ hnorm,
@@ -3833,7 +3903,8 @@ __global__ void __launch_bounds__(1024) rms_q8_kernel(float* __restrict__ h, con
 }
 
 // one block: float4 loads, four in flight per thread (the vocabulary is ~0.6 MB; scalar loads ran at ~10 GB/s)
-__global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ x, int n, int* __restrict__ out) {
+__global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ x, int n, int* __restrict__ out,
+                                                      const int* __restrict__ map, int map_from) {
     __shared__ float sv[32];
     __shared__ int si[32];
     float best = -INFINITY;
@@ -3885,7 +3956,7 @@ __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ 
     if (threadIdx.x == 0) {
         for (int i = 1; i < (int) (blockDim.x >> 5); ++i)
             if (sv[i] > best || (sv[i] == best && si[i] < bi)) { best = sv[i]; bi = si[i]; }
-        *out = bi;
+        *out = map != nullptr && bi >= map_from ? map[bi - map_from] : bi;
     }
 }
 
@@ -4053,8 +4124,9 @@ void mv_config(int r, int u, int wpb, int lds) {
 }  // namespace hip_expert_bench
 #endif
 
-// A batch's EXL3 jobs (w: an exl3::Mat) through exl3::mv, marked done: every column one EXL3 job, in launches of up to
-// exl3::kMaxMvJobs - nt > 0: nt activations one after another (mv_nt's layout), else each job's ncol at its strides
+// A batch's EXL3 jobs (w: an exl3::Mat) through exl3::mv, marked done, in launches of up to exl3::kMaxMvJobs - nt > 0:
+// nt activations one after another (mv_nt's layout), else each job's ncol at its strides; a job's activations (a
+// verify window's tokens) stay one EXL3 job of up to exl3::kMaxMvCols, its weights decoded once for several of them
 static bool exl3_jobs(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
     exl3::MvJob xj[exl3::kMaxMvJobs];
     int nx = 0;
@@ -4065,7 +4137,7 @@ static bool exl3_jobs(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t
         const int64_t xq_cs = nt > 0 ? (int64_t) (j.n_in / 32) * (int64_t) sizeof(block_q8_1) : j.xq_cstride;
         const int64_t xf_cs = nt > 0 ? j.n_in : j.xf_cstride;
         const int64_t y_cs = nt > 0 ? j.n_out : j.y_cstride;
-        for (int c = 0; c < ncol; ++c) {
+        for (int c = 0; c < ncol; c += exl3::kMaxMvCols) {
             exl3::MvJob& x = xj[nx++];
             x.m = (const exl3::Mat*) j.w;
             x.xf = j.xf != nullptr ? j.xf + c * xf_cs : nullptr;
@@ -4073,6 +4145,10 @@ static bool exl3_jobs(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t
             x.y = j.y + c * y_cs;
             x.bias = j.bias;
             x.alpha = j.alpha;
+            x.ncol = std::min(exl3::kMaxMvCols, ncol - c);
+            x.xf_cs = (size_t) xf_cs;
+            x.xq_cs = (size_t) xq_cs;
+            x.y_cs = (size_t) y_cs;
             if (nx == exl3::kMaxMvJobs) {
                 if (!exl3::mv(xj, nx, s)) return false;
                 nx = 0;
@@ -4112,7 +4188,33 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     // (one-column batches only: a verify window's several-column jobs go to the tiled kernels below)
     bool one_col = true;
     for (int i = 0; i < n; ++i) one_col = one_col && jobs[i].ncol == 1;
-    if (typed && one_col) mv_rdna(jobs, n, 1, done, s);
+    if (typed && one_col) {
+        mv_rdna(jobs, n, 1, done, s);
+    } else if (typed && mv_rdna_device()) {
+        // a verify window's several-column jobs whose columns sit one after another (mv_nt's layout): the RDNA3 kernel
+        // takes them as NT activations, each column bit for bit its one-column result - the token path's on the APUs
+        // (the MTP decode's window on the Strix / Gorgon Halo).  The rest go to the tiled kernels below.
+        MvJob sub[kMaxMvJobs];
+        int idx[kMaxMvJobs], m = 0, nc = 0;
+        for (int i = 0; i < n; ++i) {
+            const MvJob& J = jobs[i];
+            const bool packed = J.ncol >= 2 && J.ncol <= kMaxMvNt && (J.type == kTypeBF16 || J.type == 14) &&
+                                (J.xq == nullptr || J.xq_cstride == (int64_t) (J.n_in / 32) * (int64_t) sizeof(block_q8_1)) &&
+                                (J.xf == nullptr || J.xf_cstride == J.n_in) && J.y_cstride == J.n_out;
+            if (!done[i] && packed && (nc == 0 || J.ncol == nc)) {
+                nc = J.ncol;
+                sub[m] = J;
+                sub[m].ncol = 1;
+                idx[m++] = i;
+            }
+        }
+        if (m > 0) {
+            bool sub_done[kMaxMvJobs] = {};
+            mv_rdna(sub, m, nc, sub_done, s);
+            for (int k = 0; k < m; ++k)
+                if (sub_done[k]) done[idx[k]] = true;
+        }
+    }
 #endif
     // several columns: the tiled kernels (STRATA_GLM_MV_TILED=0: the column loops)
     static const bool tiled = [] {
@@ -4778,6 +4880,69 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
     launch_check("moe_down");
 }
 
+bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, float limit,
+                       size_t down_off, const void* xq, void* hq, const void* sh_down, int sh_type, const void* sh_hq,
+                       int n_ff_sh, float* sh_out, float* out, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+    MoeDev d = d_in;
+    d.skip = g_skip;
+    const int T = d.mt_T;
+    if (T < 1 || k > 8 || n_ff % GU_ROWS != 0 || n_embd % DOWN_ROWS != 0) return false;
+    const bool sh = sh_down != nullptr && sh_out != nullptr;
+    const int kk = sh ? k : k + 1;   // (as moe_gate_up: no shared expert, no block has ei == kk)
+    const auto* X = (const block_q8_1*) xq;
+    auto* H = (block_q8_1*) hq;
+    const auto* SD = (const uint8_t*) sh_down;
+    const auto* SH = (const block_q8_1*) sh_hq;
+    // gate/up: moe_gate_up's kernel for the type, the (expert, token) blocks of a chunk side by side
+    const dim3 ggu((unsigned) ((k + (sh ? 1 : 0)) * T), (unsigned) (n_ff / GU_ROWS));
+    if (gu_type == 16 && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device()) {
+        moe_gate_up_kernel<16, 16, true, false, false, true, false, 0, true><<<ggu, 16 * 32, 0, s>>>(
+            d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
+    } else {
+        switch (gu_type) {
+#define GLMF_GUM(TT) \
+            case TT: moe_gate_up_kernel<TT, GU_WARPS, false, false, false, false, false, 0, true><<<ggu, GU_WARPS * 32, 0, s>>>( \
+                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out); break;
+            GLMF_GUM(16) GLMF_GUM(18) GLMF_GUM(19) GLMF_GUM(23) GLMF_GUM(10) GLMF_GUM(11) GLMF_GUM(17) GLMF_GUM(22)
+            GLMF_GUM(21) GLMF_GUM(29) GLMF_GUM(12) GLMF_GUM(13) GLMF_GUM(14)
+#undef GLMF_GUM
+            default: return false;
+        }
+    }
+    // down: moe_down's kernel for the type, the (row block, token) blocks side by side
+    const auto* HC = (const block_q8_1*) hq;
+    if ((d_type == 22 || d_type == 18) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
+        if (d_type == 22)
+            moe_down_kernel<22, 2, true, true, true, false, true><<<(unsigned) (n_embd / 2 * T), 256, 0, s>>>(
+                d, k, n_embd, n_ff, down_off, HC, sh_out, out);
+        else
+            moe_down_kernel<18, 2, true, false, true, false, true><<<(unsigned) (n_embd / 2 * T), 256, 0, s>>>(
+                d, k, n_embd, n_ff, down_off, HC, sh_out, out);
+    } else {
+        const unsigned blocks = (unsigned) (n_embd / DOWN_ROWS * T);
+        switch (d_type) {
+#define GLMF_DNM(TT) \
+            case TT: moe_down_kernel<TT, DOWN_ROWS, false, false, false, false, true><<<blocks, 256, 0, s>>>( \
+                d, k, n_embd, n_ff, down_off, HC, sh_out, out); break;
+            GLMF_DNM(16) GLMF_DNM(18) GLMF_DNM(19) GLMF_DNM(23) GLMF_DNM(10) GLMF_DNM(11) GLMF_DNM(17) GLMF_DNM(22)
+            GLMF_DNM(21) GLMF_DNM(29) GLMF_DNM(12) GLMF_DNM(13) GLMF_DNM(14)
+#undef GLMF_DNM
+            // (the gate/up launch already went: an unknown down type cannot happen with a known gate/up type -
+            // moe_gate_up_kernel's and moe_down_kernel's lists are the same)
+            default: return false;
+        }
+    }
+    launch_check("moe_experts_multi");
+    return true;
+#else
+    (void) gu_type, (void) d_type, (void) d_in, (void) k, (void) n_embd, (void) n_ff, (void) limit, (void) down_off;
+    (void) xq, (void) hq, (void) sh_down, (void) sh_type, (void) sh_hq, (void) n_ff_sh, (void) sh_out, (void) out;
+    (void) s;
+    return false;
+#endif
+}
+
 // ---------------------------------------------------------------- a verify window's experts, each once
 namespace {
 constexpr int kWinEnt = kMaxWinTokens * 8;
@@ -4928,6 +5093,11 @@ bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s) {
     return true;
 }
 
+void moe_win_group(const MoeWin& w, cudaStream_t s) {
+    moe_win_group_kernel<<<1, 32, 0, s>>>(w);
+    launch_check("moe_win_group");
+}
+
 namespace {
 __global__ void tab_update_kernel(unsigned long long* tab, const int* keys, const unsigned long long* vals, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4959,8 +5129,13 @@ void skip_gate(const volatile int* host_from, int t, int* flag, cudaStream_t s) 
     launch_check("skip_gate");
 }
 
-void argmax(const float* x, int n, int* out, cudaStream_t s) {
-    argmax_kernel<<<1, 1024, 0, s>>>(x, n, out);
+void embed_tok(const void* table, int type, int n_rows, const int* tok, int n_embd, float* out, cudaStream_t s) {
+    embed_tok_kernel<<<(n_embd + 255) / 256, 256, 0, s>>>(table, type, n_rows, tok, n_embd, out);
+    launch_check("embed_tok");
+}
+
+void argmax(const float* x, int n, int* out, cudaStream_t s, const int* map, int map_from) {
+    argmax_kernel<<<1, 1024, 0, s>>>(x, n, out, map, map_from);
     launch_check("argmax");
 }
 

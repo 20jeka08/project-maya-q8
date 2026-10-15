@@ -588,6 +588,7 @@ Glm5Model::~Glm5Model() {
             if (s > 0) {
                 for (float* d : {c.state, c.snap, c.snap_pool, c.kda_bak})
                     if (d) cudaFree(d);
+                kv_stream_free(c.kv);   // (sequence 0's is kv_, freed below)
             }
             if (c.hop_h) cudaFreeHost(c.hop_h);
             if (c.emb_h) cudaFreeHost(c.emb_h);
@@ -628,9 +629,17 @@ Glm5Model::~Glm5Model() {
     }
     for (void* ev : {tev_a_, tev_b_, tev_c_, tev_d_})
         if (ev) cudaEventDestroy((cudaEvent_t) ev);
+    if (!bias_tab_.empty()) {   // on the tail's device (freed above with its half; the device itself is still there)
+        cudaSetDevice(bias_dev_);
+        for (float* t : bias_tab_)
+            if (t) cudaFree(t);
+        bias_tab_.clear();
+        cudaSetDevice(dev_);
+    }
     if (d_tok_) cudaFree(d_tok_);
     if (w_arena_) cudaFree(w_arena_);
     if (mtp_arena_) cudaFree(mtp_arena_);
+    kv_stream_free(kv_);
     if (state_) cudaFree(state_);
     if (sc_) cudaFree(sc_);
     if (d_pos_) cudaFree(d_pos_);
@@ -774,6 +783,7 @@ void Glm5Model::reset() {
     // of it (#133: a conversation taken back from a slot answered the other one's question, then looped).
     if (fast_ != nullptr) {
         cudaMemsetAsync(state_, 0, state_bytes_, fast_->cs);
+        kv_stream_reset_maps();   // (the zeroed slots hold no block now - on the same stream)
         if (cudaStreamSynchronize(fast_->cs) == cudaSuccess && fast_->route_error_h)
             *fast_->route_error_h = 0;   // a failed route belongs to the previous request
     } else {
@@ -781,11 +791,150 @@ void Glm5Model::reset() {
         cudaStreamSynchronize(0);
     }
     pos_ = 0;
+    mtp_hx_pos_ = -1;   // (head_x holds no position of the new sequence)
     dflash_reset();   // a new sequence: the drafter's cached positions belong to the old one
     if (split_next_) {
         split_next_->reset();
         cudaSetDevice(dev_);
     }
+}
+
+// ---- KV streaming (strata/kernels/glm_kv_stream.hpp)
+int64_t Glm5Model::kv_resident_cells(int kpool, int64_t max_ctx) {
+    const char* v = getenv("STRATA_GLM_KV_RESIDENT");
+    const long long want = v != nullptr ? std::atoll(v) : 0;
+    if (want <= 0 || kpool <= 0) return 0;
+    int64_t cells = std::max<int64_t>(want, strata::kernels::glmf::kKvResidentMin);
+    cells = (cells + kpool - 1) / kpool * kpool;
+    return cells < max_ctx ? cells : 0;   // a context of N positions or fewer is not streamed
+}
+
+int64_t Glm5Model::kv_resident() const {
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get())   // (a part without DSA layers streams none)
+        if (m->kv_ != nullptr) return m->kv_->slots * m->kv_->page;
+    return 0;
+}
+
+// This part's DSA layers (the NextN block's too) keep a sequence's latent cache in one pinned, device-mapped host
+// allocation - the authoritative copy, written by both dsa_preps - and `cells` positions of it in VRAM: the state arena's
+// latent runs are the VRAM slots, and every layer gets a residency map (one device allocation for all of them), nothing
+// resident.  ctx: that sequence's context.  Under WSL the driver pins only about 1 GB in all, which the start reports as
+// an error.  Null with err empty: no DSA layer on this part.
+Glm5Model::KvStream* Glm5Model::kv_stream_make(int64_t cells, int64_t ctx, std::string& err) {
+    namespace k = strata::kernels;
+    const std::vector<int> ls = dsa_layers();
+    if (ls.empty()) return nullptr;
+    auto* K = new KvStream();
+    K->page = g_.idx_kpool;
+    K->row_bytes = lat_q8_ ? k::glmf::lat8_rec_bytes(g_.kv_lora) : g_.kv_lora * 2;
+    K->slots = cells / K->page;
+    K->n_blocks = (ctx + K->page - 1) / K->page;
+    const auto fail = [&](const std::string& e) {
+        err = e;
+        kv_stream_free(K);
+        return nullptr;
+    };
+    if (K->slots < k::glmf::kKvResolveBlock || (int64_t) K->page * K->row_bytes % 16 != 0)
+        return fail("KV streaming: " + std::to_string(K->slots) + " pages of " + std::to_string(K->page * K->row_bytes) +
+                    " bytes a layer - the resolve needs at least " + std::to_string(k::glmf::kKvResolveBlock) +
+                    " pages of whole 16-byte runs");
+    const uint64_t layer_bytes = (uint64_t) K->n_blocks * K->page * K->row_bytes;
+    K->host_bytes = layer_bytes * ls.size();
+    uint8_t* d = nullptr;
+    if (cudaHostAlloc((void**) &K->host_arena, K->host_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &d, K->host_arena, 0) != cudaSuccess) {
+        cudaGetLastError();
+        char b[320];
+        std::snprintf(b, sizeof b, "KV streaming: cannot pin %.2f GB of RAM for the latent cache - lower the context, or "
+                      "turn it off (--kv-streaming off in the config's args; under WSL the driver pins only about 1 GB in "
+                      "all)", (double) K->host_bytes / 1e9);
+        return fail(b);
+    }
+    const auto a16 = [](uint64_t n) { return (n + 15) & ~(uint64_t) 15; };
+    const uint64_t per = a16((uint64_t) K->n_blocks * 4) + 5 * a16((uint64_t) K->slots * 4) + a16(k::kKvCtlInts * 4);
+    if (cudaMalloc(&K->map_arena, per * ls.size()) != cudaSuccess) {
+        cudaGetLastError();
+        K->map_arena = nullptr;
+        return fail("KV streaming: the residency maps did not allocate");
+    }
+    K->host.assign((size_t) g_.n_layers + 1, nullptr);
+    K->map.assign((size_t) g_.n_layers + 1, k::KvStreamMap{});
+    for (size_t i = 0; i < ls.size(); ++i) {
+        const size_t il = (size_t) ls[i];
+        K->host[il] = d + i * layer_bytes;
+        uint8_t* at = (uint8_t*) K->map_arena + i * per;
+        const auto take = [&](uint64_t n) {
+            int32_t* r = (int32_t*) at;
+            at += a16(n * 4);
+            return r;
+        };
+        k::KvStreamMap& m = K->map[il];
+        m.page_table = take((uint64_t) K->n_blocks);
+        m.slot_block = take((uint64_t) K->slots);
+        m.slot_stamp = take((uint64_t) K->slots);
+        m.slot_ref = take((uint64_t) K->slots);
+        m.miss_block = take((uint64_t) K->slots);
+        m.miss_slot = take((uint64_t) K->slots);
+        m.ctl = take(k::kKvCtlInts);
+        m.n_blocks = K->n_blocks;
+        m.n_slots = K->slots;
+        k::kv_stream_reset(m, nullptr);
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) return fail("KV streaming: the residency maps did not reset");
+    std::fprintf(stderr, "glm pack: CUDA%d KV streaming: %lld of %lld positions of each of %zu DSA layers in VRAM (%.2f "
+                         "GB), the latent cache in %.2f GB of pinned RAM\n", dev_, (long long) cells, (long long) ctx,
+                 ls.size(), (double) cells * K->row_bytes * ls.size() / 1e9, (double) K->host_bytes / 1e9);
+    return K;
+}
+
+void Glm5Model::kv_stream_free(KvStream* K) {
+    if (K == nullptr) return;
+    if (K->host_arena) cudaFreeHost(K->host_arena);
+    if (K->map_arena) cudaFree(K->map_arena);
+    delete K;
+}
+
+// the first sequence's stream (the only one without STRATA_GLM_SEQS); the prompt path's staging copy is sized for it,
+// the longest context of them all
+bool Glm5Model::kv_stream_setup(int64_t cells, std::string& err) {
+    kv_ = kv_stream_make(cells, max_ctx_, err);
+    if (kv_ != nullptr) kv_stage_bytes_ = (uint64_t) kv_->n_blocks * kv_->page * kv_->row_bytes;
+    return kv_ != nullptr || err.empty();
+}
+
+// Every block evicted (the slots' contents are stale or zeroed); the host copies are not cleared - no reader names a
+// position before this sequence has written it.  On the compute stream, after anything still queued there.
+void Glm5Model::kv_stream_reset_maps() {
+    if (kv_ == nullptr) return;
+    cudaSetDevice(dev_);
+    for (const auto& m : kv_->map)
+        if (m.page_table != nullptr) strata::kernels::kv_stream_reset(m, fast_ != nullptr ? (void*) fast_->cs : nullptr);
+}
+
+Glm5Model::KvStreamStats Glm5Model::kv_stream_stats() const {
+    KvStreamStats r;
+    int cur = 0;
+    cudaGetDevice(&cur);
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        std::vector<const KvStream*> ks = {m->kv_};   // the bound sequence's, and every other's (STRATA_GLM_SEQS)
+        for (const SeqCtx& c : m->seq_) ks.push_back(c.kv);
+        cudaSetDevice(m->dev_);
+        if (m->fast_ != nullptr) cudaStreamSynchronize(m->fast_->cs);
+        for (const KvStream* K : ks) {
+            if (K == nullptr) continue;
+            for (const auto& mp : K->map) {
+                if (mp.page_table == nullptr) continue;
+                const strata::kernels::KvStreamCounters c = strata::kernels::kv_stream_counters(mp);
+                r.lookups += c.lookups;
+                r.misses += c.misses;
+                r.overflow = r.overflow || c.overflow;
+            }
+            r.host_gb += (double) K->host_bytes / 1e9;
+            r.block_bytes = K->page * K->row_bytes;
+        }
+    }
+    cudaSetDevice(cur);
+    return r;
 }
 
 bool Glm5Model::forward(const std::vector<int32_t>& tokens, std::vector<float>& logits_out,
@@ -818,9 +967,48 @@ bool Glm5Model::forward(const std::vector<int32_t>& tokens, std::vector<float>& 
     return true;
 }
 
+const float* Glm5Model::logit_bias_table(int slot, const std::vector<std::pair<int32_t, float>>& bias,
+                                         std::string& err) {
+    if (bias.empty()) return nullptr;
+    if (slot < 0 || slot >= seq_count()) {
+        err = "logit_bias: no conversation slot " + std::to_string(slot);
+        return nullptr;
+    }
+    Glm5Model* tail = this;
+    while (tail->split_next_) tail = tail->split_next_.get();
+    const size_t n = (size_t) g_.n_vocab;
+    std::vector<float> host(n, 0.0f);
+    for (const auto& [id, b] : bias) {
+        if (id < 0 || (size_t) id >= n) {
+            err = "logit_bias: token " + std::to_string(id) + " is outside the vocabulary";
+            return nullptr;
+        }
+        host[(size_t) id] = b;
+    }
+    cudaSetDevice(tail->dev_);
+    if (bias_tab_.empty()) {
+        bias_tab_.assign((size_t) seq_count(), nullptr);
+        bias_dev_ = tail->dev_;
+    }
+    float*& tab = bias_tab_[(size_t) slot];
+    cudaError_t e = tab == nullptr ? cudaMalloc(&tab, n * sizeof(float)) : cudaSuccess;
+    // synchronous: the table is written before any of this request's samples read it, and no earlier request's
+    // sample still reads it (a slot runs one request at a time, and its last sample was synchronised)
+    if (e == cudaSuccess) e = cudaMemcpy(tab, host.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    // a copy from pageable memory can return before its DMA lands, and the sampler runs on non-blocking streams
+    // that do not wait for the default stream: wait for it here
+    if (e == cudaSuccess) e = cudaStreamSynchronize(nullptr);
+    cudaSetDevice(dev_);
+    if (e != cudaSuccess) {
+        err = std::string("logit_bias: the table did not upload: ") + cudaGetErrorString(e);
+        return nullptr;
+    }
+    return tab;
+}
+
 int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err) {
-    // the fast path already ran the greedy argmax on the device at the end of the forward
-    if (fast_ != nullptr && sp.greedy && last_tok_ >= 0) return last_tok_;
+    // the fast path already ran the greedy argmax on the device at the end of the forward (an unbiased one)
+    if (fast_ != nullptr && sp.greedy && sp.logit_bias == nullptr && last_tok_ >= 0) return last_tok_;
     Glm5Model* tail = this;
     while (tail->split_next_) tail = tail->split_next_.get();
     if (tail->d_tok_ == nullptr) {
@@ -1048,10 +1236,12 @@ static double host_read_bps() {
 // where Strata's are fits to its model:
 //   - a part's room for experts: its free VRAM less its layers' dense weights and state at the context (index.txt and
 //     the GGUF directory, as load_pack sizes them), the head and the draft block on the last part, its scratch, and
-//     the reserve fast_setup keeps (pool_avail); the pool gives every layer the same number of slots;
+//     the reserve fast_setup keeps (pool_budget: --vram-reserve-mib, or --expert-cache N on the first GPU); the pool
+//     gives every layer the same number of slots;
 //   - the experts those slots hold: each layer's most routed, their share of its routes read off the usage file's
 //     counts (STRATA_GLM_USAGE, opt-in; the pack's expert_counts.txt without it; Strata's coverage curve 1 - (1 - f)^3,
-//     STRATA_SPLIT_COVER_B, without either - that is what Strata has to assume, its profile carries only a ranking);
+//     an EXL3 pack's ^1.4, STRATA_SPLIT_COVER_B, without either - that is what Strata has to assume, its profile
+//     carries only a ranking);
 //   - a layer's time on its card: the bytes it reads (its dense weights and its VRAM experts' share of the routed
 //     ones) over the card's memory bandwidth - Strata scales a fitted per-layer time by SMs x clock; and each miss:
 //     the expert's bytes over the parts' share of the host's RAM read speed, measured here - the CPU lane computes
@@ -1123,7 +1313,11 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     }
     // the state at the context, as load_pack lays it out
     const double max_pools = (double) (max_ctx / g.idx_kpool);
-    const double lat = fast ? (double) g.kv_lora * (double) max_ctx / 2 : (double) g.kv_lora * (double) max_ctx;
+    // (KV streaming: VRAM slots for kv_cells positions; the prompt path borrows a staging copy of one layer's cache)
+    const int64_t kv_cells = fast ? Glm5Model::kv_resident_cells(g.idx_kpool, max_ctx) : 0;
+    const double lat_rows = (double) (kv_cells > 0 ? kv_cells : max_ctx);
+    const double lat = fast ? (double) g.kv_lora * lat_rows / 2 : (double) g.kv_lora * lat_rows;
+    const size_t kv_stage = kv_cells > 0 ? (size_t) g.kv_lora * 2 * (size_t) max_ctx : 0;
     const double dsa_state = 4.0 * (lat + 2.0 * g.idx_key * (double) max_ctx + (double) g.idx_key * max_pools);
     const double kda_state = 4.0 * ((double) g.d_inner() * g.kda_head_dim + 3.0 * g.d_inner() * (g.d_conv - 1));
     // a DFlash drafter (STRATA_GLM_DFLASH): its file and ring on the last part; every part keeps the verify window's
@@ -1256,7 +1450,13 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         cover[(size_t) l].assign(c.size() + 1, 0.0);
         for (size_t i = 0; i < c.size(); ++i) cover[(size_t) l][i + 1] = cover[(size_t) l][i] + c[i] / tot;
     }
-    const double cover_b = getenv("STRATA_SPLIT_COVER_B") ? std::atof(getenv("STRATA_SPLIT_COVER_B")) : 3.0;
+    // (an EXL3 pack: 1.4 - its experts are bigger, a card holds fewer of a layer's, and there the routes are flatter
+    // than the curve at 3: EXL3-4.05bpw over 9 GPUs held 80% of a 5060 Ti layer's experts and hit VRAM on 89-96% of
+    // its routes, the curve's 1.4, not 99%.  At 3 the DFlash split kept the 3090 to 7 layers with 8 GB of it idle,
+    // the misses on the CPU lane: 63.8 / 32.6 / 64.4 tok/s; at 1.4 9 layers, 79.8 / 40.4 / 81.9)
+    const double cover_b = getenv("STRATA_SPLIT_COVER_B") ? std::atof(getenv("STRATA_SPLIT_COVER_B"))
+                           : !xtab.layers.empty()         ? 1.4
+                                                          : 3.0;
     const auto held_share = [&](int l, int64_t s) -> double {
         s = std::clamp<int64_t>(s, 0, g.n_expert);
         const auto& cv = cover[(size_t) l];
@@ -1343,7 +1543,9 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             }
         }
         const double room =
-            c.free > used ? (double) Glm5Model::pool_avail((size_t) (c.free - used), (size_t) c.total) : 0.0;
+            c.free > used ? (double) Glm5Model::pool_budget((size_t) (c.free - used), (size_t) c.total, i,
+                                                            (size_t) ((double) keep * ssum), (size_t) smax).avail
+                          : 0.0;
         Eval ev;
         ev.per = bsum > 0 ? std::min<int64_t>(g.n_expert, (int64_t) (room / bsum)) : 0;
         while (ev.per > 0 && (double) ev.per * ssum > room) --ev.per;
@@ -1351,7 +1553,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         ev.ok = ssum == 0 || ev.per >= keep;
         if (ev.ok && ssum > 0) {
             const double need = (double) glm_prefill_lend_bytes(g, 512, kda, dsa, dense_ffn, moe, last && mtp, max_ctx,
-                                                                (size_t) smax);
+                                                                (size_t) smax, dsa ? kv_stage : 0);
             const int64_t k = (int64_t) std::ceil(need / ssum);
             ev.ok = k + keep <= ev.per && k * 100 <= 90 * ev.per;
         }
@@ -2842,11 +3044,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         std::fprintf(stderr, "glm mtp: CUDA%d the draft block from %s%s\n", dev_, mtp_gguf,
                      own ? " (instead of the model's own)" : "");
     }
-    // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded)
+    // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded; one GPU loads it
+    // for the one-GPU MTP decode - glm_mtp.cu: by default on the Strix / Gorgon Halo APUs)
+    const bool mtp_one = l0_ == 0 && mtp_decode_wanted(dev_, n_parts_);
     if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
-        (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr)) {   // any split: the speculative decode runs on 2+ parts
+        (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr || mtp_one)) {   // any split: the speculative decode, 2+ parts
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;
+        if (mtp_il_ >= 0 && mtp_one) mtp_vocab_scan(gfs);   // the draft head's vocabulary
     }
 
     // 5. the router bias, host-side: the prefetch ranks the next-best experts per layer, and the
@@ -2867,10 +3072,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // each card, and the prompt attention reads half as much); the reference path (STRATA_GLM_SLOW) keeps F32
     lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && getenv("STRATA_GLM_KV_INT8") != nullptr &&
               std::atoi(getenv("STRATA_GLM_KV_INT8")) != 0;
+    // KV streaming (--kv-resident N): the latent cache lives in pinned RAM and the state holds N positions of VRAM slots
+    // a layer (kv_stream_setup, below)
+    const int64_t kv_cells = fast_mode_ ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;
+    const int64_t lat_rows = kv_cells > 0 ? kv_cells : max_ctx;
     // (INT8: lat8_rec_bytes per position, a multiple of 16 bytes at kv_lora 512)
-    const int64_t lat_floats = lat_q8_      ? (int64_t) strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * max_ctx
-                               : fast_mode_ ? (int64_t) g_.kv_lora * max_ctx / 2
-                                            : (int64_t) g_.kv_lora * max_ctx;
+    const int64_t lat_floats = lat_q8_      ? (int64_t) strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * lat_rows
+                               : fast_mode_ ? (int64_t) g_.kv_lora * lat_rows / 2
+                                            : (int64_t) g_.kv_lora * lat_rows;
     if (lat_q8_) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
                               strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
     // (one entry past the trunk: the NextN block's DSA caches, when this half carries it)
@@ -2913,6 +3122,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     }
     state_bytes_ = (uint64_t) floats * sizeof(float);
     { cudaError_t e_ = cudaMalloc(&state_, state_bytes_); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    if (kv_cells > 0 && !kv_stream_setup(kv_cells, err)) return false;
     if (fast_mode_ && !seq_alloc_arenas(err)) return false;   // STRATA_GLM_SEQS: before the expert pool takes the rest
 
     const int64_t ff_max = std::max<long long>({g_.n_ff_dense, (int64_t) g_.n_ff_exp * g_.n_shared});
@@ -3177,6 +3387,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         err = "mtp: the draft block's weights (" + std::to_string(bytes >> 20) + " MB) did not allocate";
         return false;
     }
+    mtp_arena_bytes_ = bytes;
     uint64_t at = 0;
     uint8_t* base = (uint8_t*) mtp_arena_;
     std::vector<float> host;

@@ -130,7 +130,7 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
     float bv = __int_as_float(0xff800000);   // -inf
     int best = n_vocab;
     for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
-        const float s = apply_penalties(l[v], hit_count(v), p);
+        const float s = apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
         if (s > bv) { bv = s; best = v; }
     }
     for (int off = 16; off > 0; off >>= 1) {
@@ -175,8 +175,11 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
 // the draft draft[t] with probability min(1, p/q), else a draw from max(0, p - q)).  The selection is shared.
 constexpr uint64_t kSpecDraftKey = 0x5bd1e9955bd1e995ull, kSpecAcceptKey = 0x9e3779b97f4a7c15ull,
                    kSpecResidKey = 0xc2b2ae3d27d4eb4full;
+// one block of 1024 threads per row (the launches below): the bound keeps every mode at 64 registers a thread, so a
+// block fits the 64K-register file - unbounded, sm_75 (Turing) compiled the draft mode to 68 and its launch failed
+// ("too many resources requested for launch") wherever the NextN block sat on a Turing card
 template <int MODE>
-__global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
+__global__ void __launch_bounds__(1024) sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
                                const int* __restrict__ history, int history_len, const SamplerParams p,
                                int* __restrict__ out, SpecList* __restrict__ ql, const int* __restrict__ draft) {
     const int t = blockIdx.x;
@@ -258,7 +261,9 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
         if (b == 0x80000000u) b = 0u;   // -0 ties with +0, as the float comparison it replaces
         return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
     };
-    auto score = [&](int v) -> float { return apply_penalties(l[v], hit_count(v), p); };
+    auto score = [&](int v) -> float {
+        return apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
+    };
     for (int b = threadIdx.x; b < kBins; b += blockDim.x) coarse[b] = 0u;
     if (threadIdx.x == 0) sh_ncoarse = 0u;
     __syncthreads();

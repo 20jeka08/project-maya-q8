@@ -243,6 +243,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/glm_fast.cu
                           src/kernels/cuda/glm_batch.cu
                           src/kernels/cuda/exl3.cu
+                          src/kernels/cuda/exl3_legacy.cu
+                          src/kernels/cuda/glm_kv_stream.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -257,6 +259,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(exl3_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
     add_test(NAME exl3_test COMMAND exl3_test)
     set_tests_properties(exl3_test PROPERTIES TIMEOUT 120)
+  endif()
+  # the INT8 latent records' FP16 reads against the plain conversion, every code x every scale (GPU, no model)
+  if(STRATA_BUILD_TESTS)
+    add_executable(glm_lat8_test tests/glm_lat8_test.cu)
+    target_link_libraries(glm_lat8_test PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME glm_lat8_test COMMAND glm_lat8_test)
+    set_tests_properties(glm_lat8_test PROPERTIES TIMEOUT 60)
   endif()
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
   # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON
@@ -323,7 +332,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
-    src/core/glm_window.cu src/core/glm_dflash.cu)
+    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
@@ -506,6 +515,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(glm_dsa_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_dsa_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME glm_dsa_parity COMMAND glm_dsa_parity --selftest)
+
+  # KV streaming of the DSA latent cache (glm_kv_stream.hpp): streamed vs resident attention, bitwise (GPU, synthetic)
+  add_executable(glm_kv_stream_parity src/kernels/glm_kv_stream_parity.cpp)
+  target_include_directories(glm_kv_stream_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(glm_kv_stream_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME glm_kv_stream_parity COMMAND glm_kv_stream_parity --selftest)
 
   add_executable(glm_layer_parity src/kernels/glm_layer_parity.cpp)
   target_include_directories(glm_layer_parity PRIVATE ${_strata_gpu_include_directories})
@@ -809,9 +824,11 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/kq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
   else()
+    # (no VNNI / VBMI needed - cpu_avx512bw_ok() is enough to run them; no FP contraction: their sums must take
+    # ggml-cpu's float steps exactly, see iq_avx512.cpp)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-    set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mf16c;-mfma;-ffp-contract=off")
+    set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=off")
     # (AVX-512F/BW only: Skylake-SP Xeons have no VNNI, and this kernel does not need it)
     set_source_files_properties(src/kernels/cpu/kq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mf16c;-mfma")
@@ -823,6 +840,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_split_test src/kernels/cpu/native_split_test.cpp)
     target_link_libraries(native_split_test PRIVATE strata_kernels_cpu)
     add_test(NAME native_split_test COMMAND native_split_test)
+    # the multi-token expert rows (iq_avx512 / iq_avx2) bit for bit against ggml-cpu's dot, and GLM's split rows for a
+    # window of tokens against the same tokens one at a time
+    add_executable(native_rows_exact_test src/kernels/cpu/native_rows_exact_test.cpp)
+    target_link_libraries(native_rows_exact_test PRIVATE strata_kernels_cpu)
+    add_test(NAME native_rows_exact_test COMMAND native_rows_exact_test)
   endif()
   if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
     # the dense GEMV for several conversations at once (mv_nt) against the one-conversation GEMV, bit for bit; the
@@ -844,8 +866,57 @@ if(STRATA_NATIVE_EXPERTS)
     else()
       set(_strata_gg ${strata_llamacpp_SOURCE_DIR}/ggml)
     endif()
-    set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
+    # The MMQ sources are a copy of the checkout's ggml-cuda in the build tree with third_party/ggml/mmq-fused-swiglu.patch
+    # applied (the experts' SwiGLU in the gate/up product's write-back, on the MoE path; the checkout
+    # stays untouched).  The copy is redone when the checkout, its mmq.cuh or the patch changes.  A checkout the patch
+    # does not apply to builds from its own sources, and the prompt path keeps the separate SwiGLU kernel.
+    set(_strata_mmq_patch ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/mmq-fused-swiglu.patch)
+    set(_strata_mmq_copy ${CMAKE_BINARY_DIR}/strata-ggml-cuda)
+    file(SHA256 ${_strata_mmq_patch} _strata_mmq_patch_sha)
+    file(SHA256 ${_strata_gg}/src/ggml-cuda/mmq.cuh _strata_mmq_src_sha)
+    set(_strata_mmq_stamp "${_strata_gg}|${_strata_mmq_src_sha}|${_strata_mmq_patch_sha}")
+    set(_strata_mmq_done "")
+    if(EXISTS ${_strata_mmq_copy}/.strata-stamp)
+      file(READ ${_strata_mmq_copy}/.strata-stamp _strata_mmq_done)
+    endif()
+    set(_strata_mmq_glu ON)
+    if(NOT _strata_mmq_done STREQUAL _strata_mmq_stamp)
+      find_package(Git)
+    endif()
+    if(NOT _strata_mmq_done STREQUAL _strata_mmq_stamp AND NOT GIT_FOUND)
+      # (a source zip without git - docs/WINDOWS.md offers one: the checkout's own MMQ sources, as for a patch that
+      # does not apply)
+      message(WARNING "git was not found to apply third_party/ggml/mmq-fused-swiglu.patch: the pinned MMQ sources are "
+                      "built as they are, and the prompt path keeps the separate SwiGLU kernel")
+      set(_strata_mmq_glu OFF)
+    elseif(NOT _strata_mmq_done STREQUAL _strata_mmq_stamp)
+      file(REMOVE_RECURSE ${_strata_mmq_copy})
+      file(COPY ${_strata_gg}/src/ggml-cuda/ DESTINATION ${_strata_mmq_copy})
+      # (GIT_CEILING_DIRECTORIES: git applies the patch as a plain patch tool, not inside the repository holding the
+      # build tree)
+      execute_process(COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}
+                              ${GIT_EXECUTABLE} apply --ignore-whitespace ${_strata_mmq_patch}
+                      WORKING_DIRECTORY ${_strata_mmq_copy} RESULT_VARIABLE _strata_mmq_rc ERROR_VARIABLE _strata_mmq_err)
+      if(_strata_mmq_rc EQUAL 0)
+        file(WRITE ${_strata_mmq_copy}/.strata-stamp "${_strata_mmq_stamp}")
+      else()
+        message(WARNING "third_party/ggml/mmq-fused-swiglu.patch (made for the pinned ggml, third_party/ggml/VERSION.txt) "
+                        "does not apply to ${_strata_gg}/src/ggml-cuda - its own MMQ sources are built and "
+                        "the prompt path keeps the separate SwiGLU kernel:\n${_strata_mmq_err}")
+        file(REMOVE_RECURSE ${_strata_mmq_copy})
+        set(_strata_mmq_glu OFF)
+      endif()
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_strata_mmq_patch} ${_strata_gg}/src/ggml-cuda/mmq.cuh)
+    if(_strata_mmq_glu)
+      set(_strata_mmq ${_strata_mmq_copy})
+    else()
+      set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
+    endif()
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    if(_strata_mmq_glu)
+      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_GLU=1)
+    endif()
     foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)   # q8_0: the drafter's matrices (E-9); iq1_s, k-quants: GLM experts (docs/QUANT-PLAN.md)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
@@ -860,6 +931,15 @@ if(STRATA_NATIVE_EXPERTS)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
     # the GLM fast path's prompt path (src/core/glm_prefill.cu) multiplies its experts with MMQ too
     target_link_libraries(strata_engine PUBLIC strata_mmq ${_strata_gpu_blas_target})
+    if(STRATA_BUILD_TESTS)
+      # the fused gate/up + SwiGLU product against the plain product + the SwiGLU kernel, bit for bit (synthetic
+      # weights from ggml's quantizers)
+      add_executable(glm_mmq_glu_test tests/glm_mmq_glu_test.cu)
+      target_include_directories(glm_mmq_glu_test PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(glm_mmq_glu_test PRIVATE strata_mmq strata_kernels ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME glm_mmq_glu_test COMMAND glm_mmq_glu_test)
+      set_tests_properties(glm_mmq_glu_test PROPERTIES TIMEOUT 300)
+    endif()
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
     # common.cuh's native HIP path without enabling a second GGML HIP backend.
@@ -874,8 +954,10 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
+      src/prefill/moe_fused_rdna4.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_mmq}/quantize.cu")
+    target_compile_definitions(strata_engine PRIVATE STRATA_HIP_PREFILL_FUSED=1)
     foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
@@ -898,6 +980,12 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME hip_prefill_mmq_parity COMMAND hip_prefill_mmq_parity)
     set_tests_properties(hip_prefill_mmq_parity PROPERTIES TIMEOUT 120)
     list(APPEND _strata_hip_tests hip_prefill_mmq_parity)
+    add_executable(hip_prefill_fused_parity tests/hip/prefill_fused_parity.cpp)
+    target_include_directories(hip_prefill_fused_parity PRIVATE "${_strata_gg}/include")
+    target_link_libraries(hip_prefill_fused_parity PRIVATE strata_prefill strata_kernels)
+    add_test(NAME hip_prefill_fused_parity COMMAND hip_prefill_fused_parity)
+    set_tests_properties(hip_prefill_fused_parity PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    list(APPEND _strata_hip_tests hip_prefill_fused_parity)
   endif()
   if(STRATA_ENABLE_HIP)
     # Optional real-model diagnostic: pass the GGUF shard containing the native PLE key.

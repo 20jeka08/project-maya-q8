@@ -5,6 +5,7 @@
 
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/glm_kv_stream.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "glm_memory.hpp"
 #include "glm_layer_graphs.hpp"
@@ -50,6 +51,49 @@ namespace gf = strata::kernels::glmf;
 inline void cpu_relax() {
 #if defined(__x86_64__) && !defined(_WIN32)
     asm volatile("pause" ::: "memory");
+#endif
+}
+
+// Windows' HIP runtime holds the launches a stream queues until the host waits on the GPU (Linux and CUDA submit each),
+// so a token's first layers sat queued while the main thread went on enqueuing the rest, until fast_service's 1 ms kick
+// (or the token's own wait) submitted them.  This submits what `s` has queued without waiting: cudaStreamQuery, whose
+// "not ready" is no error - it is taken back off the thread's last error, which launch_check reads after every launch.
+// A launch error already pending stays for the caller's check (no submit then).  Elsewhere a no-op.
+// STRATA_GLM_FLUSH=<n>: the decode submits after its first layer and then every n layers (submit_every), 0: never -
+// the default: on the 8065S (Maya-S, drafting with the MTP rework) a submission every 4 layers lost ~4% of the decode
+// (26.5 against 27.7 tok/s, same answers); the runtime's own batching plus the service thread's kick keep the GPU fed.
+inline void submit_queued(cudaStream_t s) {
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    if (cudaPeekAtLastError() != cudaSuccess) return;
+    const cudaError_t e = cudaStreamQuery(s);
+    if (e == cudaErrorNotReady || e == cudaSuccess) (void) cudaGetLastError();
+#else
+    (void) s;
+#endif
+}
+inline int submit_every() {
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    static const int v = [] {
+        const char* e = getenv("STRATA_GLM_FLUSH");
+        return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+    }();
+    return v;
+#else
+    return 0;
+#endif
+}
+// ... and the prompt path after each mixer sub-batch and each layer's experts: STRATA_GLM_PREFILL_FLUSH=1 (off by
+// default: Maya-S on the 8065S, 2K / 8K / 16K prompts 271 / 323 / 325 tok/s with it against 273-276 / 323-325 /
+// 329-339 without - the sub-batches are long enough that the runtime's batching costs nothing)
+inline bool prefill_submit() {
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    static const bool v = [] {
+        const char* e = getenv("STRATA_GLM_PREFILL_FLUSH");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+#else
+    return false;
 #endif
 }
 
@@ -199,6 +243,10 @@ void route_dump(int layer, int k, const int* ids, const float* w);
 // STRATA_GLM_USAGE=<file>; unset or 0, none - the warm-up and the split search then go by the expert profile
 std::string usage_file();
 
+// STRATA_GLM_TRUNK_KEEP / _MAP: the route rank from which layer il leaves out its experts that are not in VRAM (8: none)
+// - the token path's routes and the verify windows' alike
+int trunk_skip_from(int il);
+
 }  // namespace glmfast
 
 namespace gf = strata::kernels::glmf;
@@ -213,6 +261,7 @@ struct Glm5Model::FastState {
     int* pf_n_buf[2] = {nullptr, nullptr};
     void* arena = nullptr;
     size_t arena_bytes = 0;
+    size_t scratch_bytes = 0, win_bytes = 0;   // the scratch slots; the verify window's buffers (the VRAM report)
     // activations (device)
     float *x = nullptr, *mixer = nullptr, *ffn = nullptr, *pre = nullptr, *post = nullptr, *comb = nullptr;
     float* part = nullptr;
@@ -225,6 +274,7 @@ struct Glm5Model::FastState {
     float *qr_raw = nullptr, *qr = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr, *iw = nullptr;
     float *q = nullptr, *iq = nullptr, *score = nullptr;
     int* cells = nullptr;
+    int* slot_cells = nullptr;   // KV streaming: the selection in VRAM slot rows (glm_kv_resolve), what the attention reads
     void *qr_q = nullptr, *attn_q = nullptr;
     float *rlog = nullptr, *plog = nullptr, *sh_g = nullptr, *sh_u = nullptr;
     float* sh_out = nullptr;   // the shared expert's down (n_embd), computed alongside the routed gate/up
@@ -272,6 +322,29 @@ struct Glm5Model::FastState {
     int* mtp_tok_h = nullptr;    // pinned
     void* spec_q = nullptr;      // speculative sampling (STRATA_GLM_SPEC_SAMPLE): the draft's kept list, a device SpecList
     cudaEvent_t ev_mtp = nullptr;
+    // the one-GPU MTP decode (src/core/glm_mtp.cu) - the draft head over the draft vocabulary (Glm5Model::mtp_vocab_scan;
+    // mtp_dv == 0: the whole head): the head's first mtp_dv rows in place, then mtp_dx rows gathered from the rest
+    // (mtp_dx_w) whose tokens are mtp_dx_ids (device: the argmax writes a token id either way)
+    int mtp_dv = 0, mtp_dx = 0;
+    void* mtp_dx_w = nullptr;
+    int* mtp_dx_ids = nullptr;
+    // ... the chained drafts (STRATA_GLM_MTP_CHAIN): token_embd on the device as stored (Q6_K / Q8_0), the token of a
+    // step after the first read there; null: every draft step takes its embedding from the host.  The host's own rows
+    // for a draft step go through mtp_emb_h, its copy out ordered by ev_mtp_emb
+    void* mtp_emb = nullptr;
+    int mtp_emb_type = -1;
+    float* mtp_emb_h = nullptr;   // pinned
+    cudaEvent_t ev_mtp_emb = nullptr;
+    bool mtp_emb_pending = false;
+    // ... and its NextN cache fill (Glm5Model::mtp_cache_rows): up to cap rows at once - the next tokens' embeddings
+    // (emb_h pinned), eh_proj's input and output, the attention norm and the cache rows' projections
+    struct MtpCacheRows {
+        int cap = 0;
+        void* arena = nullptr;
+        float *emb = nullptr, *hid = nullptr, *x = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr;
+        void *catq = nullptr, *xq = nullptr;
+        float* emb_h = nullptr;
+    } mtpc;
     // routing
     gf::MoeDev md;
     unsigned long long* tab = nullptr;
@@ -339,6 +412,29 @@ struct Glm5Model::FastState {
     };
     std::vector<LayerPool> lp;   // indexed by absolute layer
     std::vector<int> slot_of;    // il * n_expert + e -> slot in lp[il], -1 absent
+    // the pool is COMPLETE (glmfast::complete_pool: every layer's main slots hold every expert and the spares; fast_setup
+    // sized it so) ...
+    bool complete = false;
+    // ... and, as of the last boundary, every expert of every MoE layer IS in VRAM (the device tables point at all of
+    // them): a route can neither miss nor fetch, so the per-route moe_wait / moe_fetch / moe_cpu_wait launches - no-ops
+    // then - are left out (fast_moe).  Only the boundary and the prompt path's lending change the tables
+    // (a promotion only adds), so it is set there (check_resident) and holds until the next one.
+    // STRATA_GLM_RESIDENT_SKIP=0 launches them anyway (A/B); on by default on AMD only (glmfast::on_by_default_on_amd).
+    bool all_resident = false;
+    void check_resident(int l0, int lt, int n_expert) {
+        static const bool on = glmfast::on_by_default_on_amd("STRATA_GLM_RESIDENT_SKIP");
+        bool all = on;
+        for (int il = l0; il < lt && all; ++il) {
+            if (!L[(size_t) il].moe) continue;
+            const int* so = slot_of.data() + (size_t) il * n_expert;
+            for (int e = 0; e < n_expert; ++e)
+                if (so[e] < 0) {
+                    all = false;
+                    break;
+                }
+        }
+        all_resident = all;
+    }
     std::vector<uint32_t> cnt;   // il * n_expert + e -> LFU count (aged), over both tiers
     // ... and the long memory: routes per key across sessions (expert_usage.txt), halved when one passes 2^30 -
     // the warm-up fills the tiers in its order (this user's experts first)
@@ -498,6 +594,7 @@ struct Glm5Model::FastState {
         float* sh_out = nullptr;            // [tmax][n_embd] its down rows
         void* whq = nullptr;                // [tmax * 8][n_ff / 32] q8_1: each entry's h
         float* wpart = nullptr;             // [tmax * 8][n_embd]: each entry's down rows
+        float* wh = nullptr;                // EXL3: [tmax * 8][n_ff] each entry's h (F32)
         unsigned long long* grp_ptr = nullptr;
         int *grp_start = nullptr, *grp_ent = nullptr, *n_groups = nullptr;
         unsigned int* scr = nullptr;        // [0] the layer's scratch claims, [1] sticky: a slot taken twice
@@ -533,6 +630,13 @@ struct Glm5Model::FastState {
     double cal_ref = 0.0;                      // decode's CPU ms an expert after calibrating (0: not measured yet)
     uint64_t drift_e0 = 0, drift_us0 = 0;
     int drift_n = 0, drift_dir = 0;            // windows in a row >15% off, and which way
+    // lane_retime: the split re-planned from the lane's own cost in decode (only one the start-up timing chose)
+    bool cpu_retime = false;
+    uint64_t rt_e0 = 0, rt_us0 = 0, rt_r0 = 0; // the counters at the window's start
+    int rt_windows = 0, rt_changes = 0;        // windows looked at, splits changed
+    double rt_c_ms = 0.0;                      // the CPU's cost an expert the split in use was planned with
+    int rt_dir = 0;                            // the last window's way off it (+1 slower, -1 faster, 0 within 15%)
+    double rt_prev_ms = 0.0;                   // ... and its cost an expert
     bool lane_pending = false;                 // the lane and the service thread wait for fast_setup_finish
     int64_t ram_check_head = 0;                // a parallel load: the headroom ram_left_check holds the free RAM to
     double cpu_c_ms = 0.0, cpu_p_ms = 0.0;   // the lane's calibration: an expert on the CPU, one over PCIe
@@ -548,9 +652,9 @@ struct Glm5Model::FastState {
     struct CpuWin {                                          // a merged window layer (win_cpu_merged):
         std::vector<uint8_t> act, hq;                        // each token's activation quant; each entry's h quant
         std::vector<float> ff, dn;                           // each entry's n_ff / n_embd rows
+        std::vector<float> x3;                               // EXL3: each entry's rows (X3Rows)
     } cpu_win;
     std::vector<float> cpu_x3;                               // EXL3: per expert gate / up inputs, h, down input, out
-    float cpu_x3s[8][3] = {};                                // ... and the three prepared inputs' sums
     std::atomic<uint64_t> cpu_experts{0}, cpu_routes{0}, cpu_us{0};
     // STRATA_GLM_SPEC_CANCEL=1 (the pipelined two-half decode, a head half of one GPU): the head's speculative pass reads
     // the pinned, host-mapped word spec_live_h at every layer (skip_gate) into spec_skip_d - 1: its draft still stands,
@@ -632,6 +736,45 @@ struct Glm5Model::FastState {
         return false;
     }
 };
+
+// KV streaming (Glm5Model::kv_stream_setup): per DSA layer of this part (the NextN block's too), its latent cache in
+// pinned host memory - the authoritative copy, position order - and the residency map of its VRAM slots, which are
+// state_ + dsa_lat_[il] (slots * page rows).
+struct Glm5Model::KvStream {
+    int64_t slots = 0;     // VRAM pages a layer
+    int page = 4;          // positions a page: one indexer pool
+    int row_bytes = 0;     // one position's latent row: FP16 kv_lora, or an INT8 record (lat8_rec_bytes)
+    int64_t n_blocks = 0;  // pages of the context
+    std::vector<uint8_t*> host;                          // per layer: the host copy (device-mapped), null: not a DSA layer
+    std::vector<strata::kernels::KvStreamMap> map;       // per layer
+    uint8_t* host_arena = nullptr;                       // pinned: every layer's host copy
+    void* map_arena = nullptr;                           // device: every layer's map
+    uint64_t host_bytes = 0;
+};
+
+// KV streaming's two hooks for a DSA attention at decode (the token path, the verify window, the rows of several
+// sequences), for layer il of a sequence whose stream is K (null: not streamed) and whose latent run is `lat` (a
+// streamed layer's VRAM slots): where dsa_prep writes a position's latent row - the identity cache, or the host copy and
+// its block's VRAM slot - and which cells the attention reads - the selection resolved into slot rows, or itself
+inline bool kv_streamed(const Glm5Model::KvStream* K, int il) { return K != nullptr && K->host[(size_t) il] != nullptr; }
+inline void kv_prep_targets(const Glm5Model::KvStream* K, int il, uint16_t* lat, gf::DsaPrepArgs& d) {
+    if (!kv_streamed(K, il)) {
+        d.lat = lat;
+        return;
+    }
+    d.lat = nullptr;
+    d.lat_host = (uint16_t*) K->host[(size_t) il];
+    d.lat_slots = lat;
+    d.lat_table = K->map[(size_t) il].page_table;
+    d.lat_page = K->page;
+}
+inline const int* kv_attend_cells(const Glm5Model::KvStream* K, int il, uint16_t* lat, const int* cells, int n_sel,
+                                  int* slot_cells, cudaStream_t s) {
+    if (!kv_streamed(K, il)) return cells;
+    gf::glm_kv_resolve(K->map[(size_t) il], K->host[(size_t) il], (uint8_t*) lat, K->row_bytes, K->page, cells, n_sel,
+                       slot_cells, s);
+    return slot_cells;
+}
 
 
 }  // namespace strata::core
