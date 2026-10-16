@@ -30,7 +30,7 @@
   "temperature": 1.0,
   "top_p": 0.95
  },
- "reasoning_effort": "high",
+ "reasoning_effort": "max",
  "lib_dirs": [
   "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\bin"
  ],
