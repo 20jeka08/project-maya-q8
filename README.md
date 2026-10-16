@@ -4,6 +4,9 @@
 GLM-5.3-Flash, private and fast · one NVIDIA GPU or up to 16 · AMD and Windows (experimental) · chat, pictures,
 OpenAI- and Anthropic-compatible API · several requests at once</p>
 
+<p align="center">Created and led by <b>Peasant Smith</b> (<a href="https://github.com/mw00">@mw00</a>), co-maintained
+with <b><a href="https://github.com/needmorevram">@needmorevram</a></b></p>
+
 <p align="center"><a href="https://buymeacoffee.com/peasantsmith">☕ Support Project Maya - buy me a coffee</a></p>
 
 Models this size usually need a datacenter. Maya runs **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)**
@@ -44,8 +47,6 @@ The setup asks which one to download and recommends one for your PC. How they're
 | --- | ---: | --- | --- |
 | [EXL3 3.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw) by turboderp | 125.3 GB | in the setup: `--model EXL3-3.05bpw` | NVIDIA only, experimental |
 | [EXL3 4.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw) by turboderp | 165.2 GB | in the setup: `--model EXL3-4.05bpw` | NVIDIA only, experimental |
-| [AJ-IQ2_XXS](https://huggingface.co/aj9o9/GLM-5.3-Flash-GGUF/tree/main/AJ-IQ2_XXS) by aj9o9 | 87.4 GB | its files, then `--gguf-dir` | no MTP block |
-| [AJ-IQ3_XXS](https://huggingface.co/aj9o9/GLM-5.3-Flash-GGUF/tree/main/AJ-IQ3_XXS) by aj9o9 | 112.4 GB | its files, then `--gguf-dir` | no MTP block |
 
 </details>
 
@@ -64,11 +65,14 @@ Real machines, real numbers, most of them measured with `./maya.sh --bench`. A t
 | **2x RTX 3090 24 GB** (PCIe 4.0 x16, power-capped at 250 W), EPYC 7452, 256 GB RAM | Maya-M / Maya-L, 128K context | 44.0 / 30.2 tokens/s | 860 / 801 tokens/s | @orochifj (v1.1.4, #165) |
 | **2x RTX 4090 24 GB** (PCIe 3.0 + 4.0 x16), 2x Xeon Silver 4309Y, 188 GB RAM | Maya-S24 | 40.5 tokens/s | 1271 tokens/s | @fuad00 (v1.1.0, #122) |
 | **2x Tesla V100 32 GB** (PCIe 3), Xeon E5-2690 v4, 30 GB RAM | Maya-S | up to 40 tokens/s | up to 670 tokens/s | maintainer |
+| **2x Tesla V100 32 GB** (PCIe 3.0 x8 each), Ryzen 9 7945HX3D, 96 GB RAM | Maya-M / Maya-L | 33.8 / 13.3 tokens/s | 490 / 372 tokens/s | @nkhaooat (v1.1.11, #208) |
 | **RTX 3090 24 GB + RTX 3060 12 GB** (PCIe 4.0 x16), EPYC 7702P (8-channel DDR4), 141 GB RAM (a VM) | Maya-M, 128K context | 33.7 tokens/s | 682 tokens/s | @erikash (v1.1.4, #157) |
 | **RTX 5090 32 GB**, Ryzen 9 7950X, 96 GB DDR5 | Maya-M | 30+ tokens/s | ~2000 tokens/s | @siganos (#43) |
 | **AMD Radeon 8065S** (Ryzen AI Max+ PRO 495, 192 GB LPDDR5X, 160 GB of it for the GPU), Windows 11 | Maya-S, 32K context | up to 29.6 tokens/s (23.2 after an 8K-token prompt) | 278 tokens/s | maintainer (v1.1.10) |
 | **1x RTX 3090 24 GB** (PCIe 4.0 x16), EPYC 7702P (8-channel DDR4), 141 GB RAM (a VM) | Maya-M, 128K context | 27.0 tokens/s | 1069 tokens/s | @erikash (v1.1.4, #157) |
 | **1x Tesla V100 32 GB** (PCIe 3), 2x Xeon Gold 6138, 183 GB RAM | Maya-S24 | 26.8 tokens/s | 541 tokens/s | maintainer (v1.1.7, #171) |
+| **RTX 4080 SUPER 32 GB** (a 32 GB modded card), Threadripper 3970X, 157 GB RAM, SATA SSD | Maya-S24, 262K context | 26.7 tokens/s | 1552 tokens/s | @Micro-ATP (v1.1.11, #200) |
+| **3x Tesla V100 16 GB** (PCIe 3.0 x16), 2x Xeon E5-2690 v4, 62 GB RAM | Maya-S, 128K context | 26.6 tokens/s | 497 tokens/s | @saatvik-viniak (v1.1.11, #211) |
 | **4x RTX 3080 20 GB**, 64 GB DDR4 | Maya-M, 512K context | 26.3 tokens/s (a day of use) | - | @CoolJohn-lab (#104) |
 | **1x RTX 3090 24 GB** (power-capped at 225 W), Threadripper 3970X, 128 GB RAM | Maya-S24 | 26.0 tokens/s | 913 tokens/s | @briepala (v1.1.2, #135) |
 | **RTX PRO 4000 Blackwell 24 GB**, Core i9-13900K, 128 GB DDR5 | Maya-S24 | 24.7 tokens/s | 1146 tokens/s | @morrisfamily (v1.1.7, #174) |
@@ -95,10 +99,10 @@ VRAM holds, the more it gains ([how](docs/SETTINGS.md#several-requests-at-once))
 
 | | |
 | --- | --- |
-| **GPU** | NVIDIA, compute capability 7.0 or newer (V100, RTX 20 and newer): one, or up to 16 that share the model. More VRAM is faster. **AMD (experimental):** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo and Gorgon Halo (Radeon 8060S / 8065S), text only - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
+| **GPU** | NVIDIA, compute capability 7.0 or newer (V100, RTX 20 and newer): one, or up to 16 that share the model. More VRAM is faster. Pascal (Tesla P40 / P100, GTX 10) is experimental, not validated yet. **AMD (experimental):** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo and Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 and Radeon PRO V620 / W6800 not validated yet; text only - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **RAM** | 32 GB runs it. More RAM keeps more experts close and is faster |
 | **Disk** | **A fast NVMe SSD** with room for the model (~100 GB for Maya-S, ~160 GB for Maya-L) and its picture encoder (1.1 GB). Not a hard disk |
-| **System** | Linux (x86-64; a CPU with AVX2 is best), the NVIDIA driver, CUDA 12.x (CUDA 13 works for RTX 20 and newer, not for the V100), g++, Python 3.10+. Windows 10/11 (experimental): [docs/WINDOWS.md](docs/WINDOWS.md). Not WSL2. AMD: ROCm 7 |
+| **System** | Linux (x86-64; a CPU with AVX2 is best), the NVIDIA driver, CUDA 12.x (CUDA 13 works for RTX 20 and newer, not for the V100 or Pascal), g++, Python 3.10+. Windows 10/11 (experimental): [docs/WINDOWS.md](docs/WINDOWS.md). Not WSL2. AMD: ROCm 7 |
 
 The setup checks all of this, prints the exact command for anything missing, and installs nothing system-wide.
 
@@ -188,6 +192,12 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
 
 ## Credits and license
 
+- **People:** Project Maya is created and led by Peasant Smith ([@mw00](https://github.com/mw00),
+  [X](https://x.com/PeasantSmith)), who owns the project, its name and the Maya models.
+  [@needmorevram](https://github.com/needmorevram) ([X](https://x.com/needmorevram)) is a co-maintainer and
+  contributed major features: DFlash2 drafting, EXL3 support, KV streaming, conversation checkpoints, the layer-split
+  search, the expert profile and the CPU expert kernels. Thanks also to everyone who sent code and speed reports
+  ([contributors](https://github.com/mw00/project-maya/graphs/contributors)).
 - **Built on [Strata](https://github.com/Niko1221/Strata)** (MIT License, Copyright (c) 2026 Niko1221 and the Strata
   contributors): Maya's engine started from Strata's and was rewritten for GLM-5.3-Flash (the expert tiers across VRAM,
   RAM and SSD, the layer split, MTP decoding), and its server and dashboard grew from Strata's. **And on

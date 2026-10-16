@@ -1054,10 +1054,9 @@ __device__ __forceinline__ void rows_dot(const uint8_t* const* rows, const block
 #pragma unroll
             for (int r = 0; r < NR; ++r) acc[r] += dwk<T>(rows[r], kbx, iqs, xk);
         }
-    } else if constexpr (T == 12 || T == 13 || T == 14 || T == 8) {
-        // Q4_K / Q5_K / Q6_K / Q8_0 experts (K-quant and Q8_0 GGUFs other than Maya's): no shared-activation form
-        // yet - each row takes the dense GEMV's dot (row_dot), the activation re-read per row.  Q8_0 is the same
-        // shape with 32-value blocks: F<8>'s ipb 4 / step 2 walks a block's 8 ints in four calls of two.
+    } else if constexpr (T == 8 || T == 12 || T == 13 || T == 14) {
+        // Q4_K / Q5_K / Q6_K experts (K-quant GGUFs other than Maya's): no shared-activation form yet - each row
+        // takes the dense GEMV's dot (row_dot), the activation re-read per row
         for (int k = lane; k < nb * Fm::ipb; k += 32) {
             const int kbx = k / Fm::ipb, iqs = Fm::step * (k % Fm::ipb);
 #pragma unroll
@@ -3081,7 +3080,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             for (int i = 0; i < a.k; ++i) {
                 const size_t key = (size_t) a.layer * E + s_ids[i];
                 const unsigned int c = a.d.dcnt != nullptr ? ++a.d.dcnt[key] : 0u;
-                if (i < skip_from && a.d.tab[key] == 0ull && rtab[key] != 0ull) {
+                if (i < skip_from && a.d.tab[key] == 0ull && rtab[key] != 0ull &&
+                    !(a.d.helper_owned && a.d.helper_owned[key])) {
                     ri[f_ram] = i;
                     rcnt[f_ram++] = c;
                 }
@@ -3104,6 +3104,10 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             s_cs[i] = 0ull;
             if (ptr == 0ull && i >= skip_from) {
                 // left out: the expert kernels skip a null plan entry (a draft only has to be a good guess)
+            } else if (ptr == 0ull && a.d.helper_owned && a.d.helper_owned[key]) {
+                // A helper resident is claimed BEFORE PCIe quotas, promotion or disk skipping.
+                // cpu_src stays zero: the host resolves this key in the helper's own cache.
+                cpu |= 1u << i;
             } else if (ptr == 0ull) {
                 src = rtab[key];
                 if (src != 0ull && ((host_set >> i) & 1u)) {
@@ -3183,7 +3187,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
                 const int e = s_pred[i];
                 if (e < 0) continue;
                 const size_t key = (size_t) L1 * E + e;
-                if (a.d.tab[key] != 0ull) continue;
+                if (a.d.tab[key] != 0ull || (a.d.helper_owned && a.d.helper_owned[key])) continue;
                 const unsigned long long src = rtab[key];
                 if (src == 0ull) continue;
                 int navail = 0, first = -1;
@@ -3984,8 +3988,8 @@ void launch_check(const char* what) {
 bool mv_supported(int type) { return mv_type_ok(type) != 0; }
 
 bool moe_supported(int type) {   // moe_gate_up's and moe_down's instantiations
-    return type == 8 || type == 10 || type == 11 || type == 12 || type == 13 || type == 14 || type == 16 ||
-           type == 17 || type == 18 || type == 19 || type == 21 || type == 22 || type == 23 || type == 29;
+    return type == 8 || type == 10 || type == 11 || type == 12 || type == 13 || type == 14 || type == 16 || type == 17 ||
+           type == 18 || type == 19 || type == 21 || type == 22 || type == 23 || type == 29;
 }
 
 int launch_errors() { return g_launch_errors.load(std::memory_order_relaxed) + exl3::launch_errors(); }

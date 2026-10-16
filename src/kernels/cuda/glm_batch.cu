@@ -5,6 +5,16 @@
 // would have left up to float rounding - the projections around them (FP16 tensor-core GEMMs instead of q8_1 dot
 // products) are where the two paths really differ, as llama.cpp's batched and one-token paths do.
 #if defined(STRATA_USE_HIP)
+// rocWMMA (the f16q prompt attention) knows gfx11 and gfx12 only: its config.hpp stops a device pass for any other
+// architecture (RDNA 2, gfx1030) with a static_assert, so that pass leaves it out and compiles the f16q kernel empty -
+// a GPU without WMMA never takes f16q (glm_prefill.cu's mla_attn_path).  The host pass reads it as before.
+#if !(defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) || defined(__gfx1100__) || defined(__gfx1101__) || \
+    defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
+#define STRATA_ROCWMMA 1
+#else
+#define STRATA_ROCWMMA 0
+#endif
+#if STRATA_ROCWMMA
 // The HIP bf16/fp8 headers rocWMMA pulls in define the __shfl_*_sync names that the force-included hip_compat macros
 // remap; hide the macros while they are read.
 #pragma push_macro("__shfl_xor_sync")
@@ -20,6 +30,7 @@
 #pragma pop_macro("__shfl_down_sync")
 #pragma pop_macro("__shfl_up_sync")
 #pragma pop_macro("__shfl_sync")
+#endif
 #endif
 #include "strata/kernels/glm_batch.hpp"
 #include "dsa_topk.cuh"
@@ -784,6 +795,9 @@ __global__ void __launch_bounds__(256) mla_attn_tc_kernel(const float* __restric
                                                           const int* __restrict__ cells_all,
                                                           const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
                                                           float scale, float* __restrict__ ctx, bool q8) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    // Pascal (sm_6x): no tensor cores - mla_attn takes the F32 kernel there (major < 7), never this one
+#else
     using namespace nvcuda;
     constexpr int KV = 512;
     extern __shared__ __align__(128) unsigned char tc_sm[];
@@ -892,6 +906,7 @@ __global__ void __launch_bounds__(256) mla_attn_tc_kernel(const float* __restric
         const float L = s_l[i / KV];
         o[i] = L > 0.0f ? sO[i] / L : 0.0f;
     }
+#endif
 }
 
 // The same tensor-core attention with the context O in the wmma accumulator registers (four 16-wide column tiles a
@@ -905,6 +920,9 @@ __global__ void __launch_bounds__(256) mla_attn_tc_reg_kernel(const float* __res
                                                               const int* __restrict__ cells_all,
                                                               const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
                                                               float scale, float* __restrict__ ctx, bool q8) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    // Pascal (sm_6x): no tensor cores - never picked there (it needs sm_75's fragment layout)
+#else
     using namespace nvcuda;
     constexpr int KV = 512;
     extern __shared__ __align__(128) unsigned char tc_sm[];
@@ -1025,6 +1043,7 @@ __global__ void __launch_bounds__(256) mla_attn_tc_reg_kernel(const float* __res
         const float L = s_l[i / KV];
         o[i] = L > 0.0f ? o[i] / L : 0.0f;
     }
+#endif
 }
 
 // The same attention on Ampere and newer (sm_80+: mma.sync m16n8k16 and ldmatrix), FlashAttention-2 style: block =
@@ -1245,6 +1264,9 @@ __global__ void __launch_bounds__(256) mla_attn_wmma_kernel(const _Float16* __re
                                                             const int* __restrict__ cells_all,
                                                             const int* __restrict__ n_sel_arr, int n_sel_max,
                                                             int n_head, float scale, float* __restrict__ ctx, bool q8) {
+#if !STRATA_ROCWMMA
+    __builtin_trap();   // (a device pass without rocWMMA: never launched there)
+#else
     namespace wm = rocwmma;
     constexpr int KV = 512;
     extern __shared__ __align__(128) unsigned char hw_sm[];
@@ -1347,6 +1369,7 @@ __global__ void __launch_bounds__(256) mla_attn_wmma_kernel(const _Float16* __re
         const float L = s_l[i / KV];
         o[i] = L > 0.0f ? sO[i] / L : 0.0f;
     }
+#endif
 }
 
 using mla2_h16 = _Float16 __attribute__((ext_vector_type(16)));
